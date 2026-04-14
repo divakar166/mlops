@@ -1,16 +1,11 @@
-# src/data_validation.py
-
 import great_expectations as gx
 import pandas as pd
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import warnings
 warnings.filterwarnings("ignore", message="`result_format` configured at the Validator-level.*")
 
-VALID_CATEGORIES = ["grocery", "restaurant", "retail", "online", "travel"]
-
-
-def validate_transaction(data: Dict[str, Any]) -> Dict[str, Any]:
+def validate_transaction(data: Dict[str, Any], validation_categories: List[Any]) -> Dict[str, Any]:
     errors = []
 
     amount = data.get("amount")
@@ -44,9 +39,9 @@ def validate_transaction(data: Dict[str, Any]) -> Dict[str, Any]:
         errors.append("merchant_category is required")
     elif not isinstance(category, str):
         errors.append(f"merchant_category must be a string (got {type(category).__name__})")
-    elif category not in VALID_CATEGORIES:
+    elif category not in validation_categories:
         errors.append(
-            f"merchant_category must be one of {VALID_CATEGORIES} (got '{category}')"
+            f"merchant_category must be one of {validation_categories} (got '{category}')"
         )
 
     return {
@@ -55,7 +50,7 @@ def validate_transaction(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def validate_batch(df: pd.DataFrame) -> Dict[str, Any]:
+def validate_batch(df: pd.DataFrame, validation_categories: List[Any]) -> Dict[str, Any]:
     context = gx.get_context()
 
     datasource_name = "txn_pandas_source"
@@ -113,7 +108,7 @@ def validate_batch(df: pd.DataFrame) -> Dict[str, Any]:
     expectation_results.append(("merchant_category_not_null", r.success, r.result))
 
     r = validator.expect_column_values_to_be_in_set(
-        "merchant_category", VALID_CATEGORIES
+        "merchant_category", validation_categories
     )
     expectation_results.append(("category_valid", r.success, r.result))
 
@@ -138,6 +133,12 @@ if __name__ == "__main__":
     print("-"*60)
     print("TESTING DATA VALIDATION")
     print("-"*60)
+
+    import pickle
+    with open("models/encoder.pkl", "rb") as f:
+        encoder = pickle.load(f)
+    print("Encoder loaded successfully!")
+    VALID_CATEGORIES = set(encoder.classes_)
     
     # Test single transaction validation
     print("\n1. Single Transaction Validation")
@@ -167,7 +168,7 @@ if __name__ == "__main__":
     ]
     
     for tc in test_cases:
-        result = validate_transaction(tc["data"])
+        result = validate_transaction(tc["data"], VALID_CATEGORIES)
         status = "PASS" if result["valid"] else "FAIL"
         print(f"\n{tc['name']}: {status}")
         if result["errors"]:
@@ -179,7 +180,7 @@ if __name__ == "__main__":
     print("-"*40)
     
     train_df = pd.read_csv('data/train.csv')
-    results = validate_batch(train_df)
+    results = validate_batch(train_df, VALID_CATEGORIES)
     
     print(f"\nTraining data validation: {results['passed']}/{results['total']} checks passed")
     print(f"Pass rate: {results['pass_rate']:.1%}")
