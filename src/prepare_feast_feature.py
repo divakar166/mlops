@@ -17,17 +17,14 @@ def compute_merchant_features(df: pd.DataFrame, split: str = "train") -> pd.Data
         transaction_count=("amount", "count"),
         fraud_rate=("is_fraud", "mean"),
     ).reset_index()
+
+    last_seen = df.groupby("merchant_category")["event_timestamp"].max().reset_index()
+    last_seen.rename(columns={"event_timestamp": "event_timestamp"}, inplace=True)
+    stats = stats.merge(last_seen, on="merchant_category")
     
-    # Flatten column names
-    stats.columns = ['merchant_category', 'avg_amount', 'transaction_count', 'fraud_rate']
-    
-    stats['event_timestamp'] = datetime.now()
-    
-    # Convert types to match Feast schema
-    stats['avg_amount'] = stats['avg_amount'].astype('float32')
-    stats['transaction_count'] = stats['transaction_count'].astype('int64')
-    stats['fraud_rate'] = stats['fraud_rate'].astype('float32')
-    
+    stats["avg_amount"]        = stats["avg_amount"].astype("float32")
+    stats["transaction_count"] = stats["transaction_count"].astype("int64")
+    stats["fraud_rate"]        = stats["fraud_rate"].astype("float32")
     return stats
 
 def main():

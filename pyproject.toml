@@ -17,4 +17,5 @@ dependencies = [
     "pytest-cov>=7.1.0",
     "scikit-learn>=1.7.2",
     "scipy>=1.15.3",
+    "slowapi>=0.1.9",
 ]

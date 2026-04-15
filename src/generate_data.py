@@ -1,10 +1,19 @@
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
 
 def generate_transactions(n_samples=10000, fraud_ratio=0.02, seed=42):
     np.random.seed(seed)
     n_fraud = int(n_samples * fraud_ratio)
     n_legit = n_samples - n_fraud
+
+    end_time   = datetime.utcnow()
+    start_time = end_time - timedelta(days=90)
+    total_seconds = int((end_time - start_time).total_seconds())
+
+    def random_timestamps(n):
+        offsets = np.random.randint(0, total_seconds, size=n)
+        return [start_time + timedelta(seconds=int(s)) for s in offsets]
 
     # Legitimate transactions: normal shopping patterns
     # - Amounts follow a log-normal distribution (most small, some large)
@@ -19,7 +28,8 @@ def generate_transactions(n_samples=10000, fraud_ratio=0.02, seed=42):
             size=n_legit,
             p=[0.30, 0.25, 0.25, 0.15, 0.05]  # Weighted toward everyday shopping
         ),
-        "is_fraud": 0
+        "is_fraud": 0,
+        "event_timestamp": random_timestamps(n_legit)
     })
     
     # Fraudulent transactions: suspicious patterns
@@ -35,7 +45,8 @@ def generate_transactions(n_samples=10000, fraud_ratio=0.02, seed=42):
             size=n_fraud,
             p=[0.05, 0.05, 0.10, 0.60, 0.20]  # Weighted toward online/travel
         ),
-        "is_fraud": 1
+        "is_fraud": 1,
+        "event_timestamp": random_timestamps(n_fraud)
     })
     
     # Combine and shuffle
@@ -50,8 +61,10 @@ if __name__ == "__main__":
     df = generate_transactions(n_samples=10000, fraud_ratio=0.02)
     
     # Split into train (80%) and test (20%)
-    train_df = df.sample(frac=0.8, random_state=42)
-    test_df = df.drop(train_df.index)
+    df_sorted  = df.sort_values("event_timestamp").reset_index(drop=True)
+    split_idx  = int(len(df_sorted) * 0.8)
+    train_df   = df_sorted.iloc[:split_idx]
+    test_df    = df_sorted.iloc[split_idx:]
     
     # Save to CSV files
     train_df.to_csv("data/train.csv", index=False)

@@ -68,4 +68,5 @@ htmlcov/
 Thumbs.db
 
 # Logs
-*.log".env" 
+*.log
+.env

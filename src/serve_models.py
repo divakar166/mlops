@@ -10,6 +10,11 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Depends, BackgroundTasks, status
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
+from starlette.responses import Response
 from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
@@ -64,6 +69,18 @@ async def verify_api_key(
             detail="Invalid API key.",
         )
     return key
+
+def get_api_key_for_limiting(request: Request) -> str:
+    key = request.headers.get("x-api-key")
+    if key:
+        import hashlib
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+    return get_remote_address(request)
+
+limiter = Limiter(
+    key_func=get_api_key_for_limiting,
+    default_limits=["200/minute"],
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -147,6 +164,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # Request-ID + latency middleware
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
@@ -216,7 +237,8 @@ def get_ctx(request: Request) -> AppState:
     tags=["Prediction"],
     dependencies=[Depends(verify_api_key)]
 )
-def predict(tx: Transaction, request: Request, background_tasks: BackgroundTasks, ctx: AppState = Depends(get_ctx)):
+@limiter.limit("30/minute")
+def predict(tx: Transaction, request: Request, response: Response, background_tasks: BackgroundTasks, ctx: AppState = Depends(get_ctx)):
     """
     Score a transaction for fraud.
 
@@ -321,6 +343,7 @@ def predict(tx: Transaction, request: Request, background_tasks: BackgroundTasks
 
 
 @app.get("/health", tags=["Ops"])
+@limiter.exempt
 def health(ctx: AppState = Depends(get_ctx)):
     """Liveness probe. Returns 503 if the model is not loaded."""
     if ctx.model is None or ctx.encoder is None:
