@@ -1,5 +1,3 @@
-# src/train_mlflow.py
-
 import pandas as pd
 import mlflow
 import mlflow.sklearn
@@ -10,7 +8,8 @@ from sklearn.metrics import (
     precision_score, 
     recall_score, 
     f1_score,
-    roc_auc_score
+    roc_auc_score,
+    average_precision_score
 )
 import pickle
 from datetime import datetime
@@ -27,7 +26,7 @@ def load_and_preprocess_data():
     test_df = pd.read_csv("data/test.csv")
 
     train_df = get_training_features(train_df)
-    test_df = get_training_features(test_df)
+    test_df  = get_training_features(test_df)
     
     # Encode categorical feature
     encoder = LabelEncoder()
@@ -48,7 +47,8 @@ def train_and_log_model(
     n_estimators: int = 100,
     max_depth: int = 10,
     min_samples_split: int = 2,
-    min_samples_leaf: int = 1
+    min_samples_leaf: int = 1,
+    class_weight: str = "balanced"
 ):
     X_train, y_train, X_test, y_test, encoder = load_and_preprocess_data()
     
@@ -61,6 +61,14 @@ def train_and_log_model(
         mlflow.log_param("min_samples_split", min_samples_split)
         mlflow.log_param("min_samples_leaf", min_samples_leaf)
         mlflow.log_param("model_type", "RandomForestClassifier")
+        mlflow.log_param("class_weight", class_weight)
+
+        n_neg = int((y_train == 0).sum())
+        n_pos = int((y_train == 1).sum())
+        ratio  = n_neg / n_pos
+        mlflow.log_param("class_0_count", n_neg)
+        mlflow.log_param("class_1_count", n_pos)
+        mlflow.log_param("imbalance_ratio", round(ratio, 2))
         
         mlflow.log_param("train_samples", len(X_train))
         mlflow.log_param("test_samples", len(X_test))
@@ -74,6 +82,7 @@ def train_and_log_model(
             max_depth=max_depth,
             min_samples_split=min_samples_split,
             min_samples_leaf=min_samples_leaf,
+            class_weight=class_weight,
             random_state=42,
             n_jobs=-1
         )
@@ -89,6 +98,7 @@ def train_and_log_model(
             recall = recall_score(y, y_pred, zero_division=0)
             f1 = f1_score(y, y_pred, zero_division=0)
             roc_auc = roc_auc_score(y, y_prob)
+            pr_auc = average_precision_score(y, y_prob)
             
             # Log metrics with dataset prefix
             mlflow.log_metric(f"{dataset_name}_accuracy", accuracy)
@@ -96,14 +106,12 @@ def train_and_log_model(
             mlflow.log_metric(f"{dataset_name}_recall", recall)
             mlflow.log_metric(f"{dataset_name}_f1", f1)
             mlflow.log_metric(f"{dataset_name}_roc_auc", roc_auc)
+            mlflow.log_metric(f"{dataset_name}_pr_auc", pr_auc)
             
-            print(f"  {dataset_name.upper()} - Accuracy: {accuracy:.4f}, F1: {f1:.4f}, ROC-AUC: {roc_auc:.4f}")
+            print(f"  {dataset_name.upper()} — Accuracy: {accuracy:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | ROC-AUC: {roc_auc:.4f} | PR-AUC: {pr_auc:.4f}")
         
         # Log feature importance
-        for feature, importance in zip(
-            ["amount", "hour", "day_of_week", "merchant_encoded"],
-            model.feature_importances_
-        ):
+        for feature, importance in zip(X_train.columns, model.feature_importances_):
             mlflow.log_metric(f"importance_{feature}", importance)
         
         print("\nRegistering model in MLflow Model Registry...")
@@ -131,11 +139,12 @@ def run_experiment_sweep():
     
     # Define different configurations to try
     experiments = [
-        {"n_estimators": 50, "max_depth": 5},
-        {"n_estimators": 100, "max_depth": 10},
-        {"n_estimators": 100, "max_depth": 15},
-        {"n_estimators": 200, "max_depth": 10},
-        {"n_estimators": 200, "max_depth": 20},
+        {"n_estimators": 100, "max_depth": 10, "class_weight": None},
+        {"n_estimators":  50, "max_depth":  5, "class_weight": "balanced"},
+        {"n_estimators": 100, "max_depth": 10, "class_weight": "balanced"},
+        {"n_estimators": 100, "max_depth": 15, "class_weight": "balanced"},
+        {"n_estimators": 200, "max_depth": 10, "class_weight": "balanced"},
+        {"n_estimators": 200, "max_depth": 20, "class_weight": "balanced"},
     ]
     
     for i, params in enumerate(experiments, 1):

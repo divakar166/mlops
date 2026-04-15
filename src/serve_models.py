@@ -7,12 +7,18 @@ from contextlib import asynccontextmanager
 import mlflow
 import mlflow.sklearn
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Depends, BackgroundTasks, status
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
+import os
+from dotenv import load_dotenv
 
 from src.data_validation import validate_transaction
-from src.feast_feature import get_online_features
+from src.feast_feature import get_online_features, get_store
+from src.db import init_pool, close_pool, persist_prediction
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,19 +27,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fraud_detection")
 
-class AppState:
-    model = None
-    encoder = None
+class AppState(BaseModel):
+    model: object = None
+    encoder: object = None
     valid_categories: set[str] = set()
     model_version: str = "unknown"
     loaded_at: float = 0.0
 
-state = AppState()
+API_KEY = os.environ.get("FRAUD_API_KEY", None)
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+async def verify_api_key(
+    request: Request,
+    key: str | None = Depends(api_key_header),
+) -> str:
+    """Reusable dependency — raises 401/403 on bad/missing key."""
+    if not API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server auth not configured.",
+        )
+    if key is None:
+        logger.warning("Missing API key [request_id=%s]", getattr(request.state, "request_id", "unknown"))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    if key != API_KEY:
+        logger.warning(
+            "Invalid API key attempt [request_id=%s]",
+            getattr(request.state, "request_id", "unknown"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key.",
+        )
+    return key
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.ctx = AppState()
+    ctx = app.state.ctx
+
     t0 = time.perf_counter()
     logger.info("Starting up fraud-detection service …")
+
+    missing = [v for v in ("FRAUD_API_KEY", "DATABASE_URL") if not os.getenv(v)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {missing}")
     
     tracking_uri = "http://localhost:5000"
     model_uri    = "models:/fraud-detection-model@champion"
@@ -41,7 +83,7 @@ async def lifespan(app: FastAPI):
     logger.info("MLflow tracking URI set to %s", tracking_uri)
 
     try:
-        state.model = mlflow.sklearn.load_model(model_uri)
+        ctx.model = mlflow.sklearn.load_model(model_uri)
         logger.info("Champion model loaded from MLflow registry (%s)", model_uri)
     except Exception:
         logger.exception("Failed to load model from MLflow — aborting startup")
@@ -50,7 +92,7 @@ async def lifespan(app: FastAPI):
     try:
         client = mlflow.MlflowClient()
         mv = client.get_model_version_by_alias("fraud-detection-model", "champion")
-        state.model_version = mv.version
+        ctx.model_version = mv.version
         logger.info("Model version: %s (run_id=%s)", mv.version, mv.run_id)
     except Exception:
         logger.warning("Could not fetch model version metadata — continuing anyway")
@@ -58,12 +100,12 @@ async def lifespan(app: FastAPI):
     encoder_path = "models/encoder.pkl"
     try:
         with open(encoder_path, "rb") as f:
-            state.encoder = pickle.load(f)
-        state.valid_categories = set(state.encoder.classes_)
+            ctx.encoder = pickle.load(f)
+        ctx.valid_categories = set(ctx.encoder.classes_)
         logger.info(
             "Encoder loaded from %s (%d categories)",
             encoder_path,
-            len(state.valid_categories),
+            len(ctx.valid_categories),
         )
     except FileNotFoundError:
         logger.exception("Encoder file not found at %s", encoder_path)
@@ -72,15 +114,30 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to load encoder")
         raise
 
-    state.loaded_at = time.time()
+    try:
+        get_store()
+        logger.info("Feast FeatureStore initialized successfully")
+    except Exception:
+        logger.exception("Failed to initialize Feast FeatureStore — aborting startup")
+        raise
+
+    try:
+        init_pool(min_conn=1, max_conn=10)
+        logger.info("DB pool initialized")
+    except Exception:
+        logger.exception("Failed to initialize DB pool — aborting startup")
+        raise
+
+    ctx.loaded_at = time.time()
     elapsed = time.perf_counter() - t0
     logger.info("Startup complete in %.3fs", elapsed)
 
     yield
 
     logger.info("Shutting down fraud-detection service …")
-    state.model   = None
-    state.encoder = None
+    ctx.model   = None
+    ctx.encoder = None
+    close_pool()
     logger.info("Resources released. Goodbye.")
 
 app = FastAPI(
@@ -139,11 +196,16 @@ class PredictionResponse(BaseModel):
     model_source: str = "MLflow Production"
     model_version: str
     validation_passed: bool = True
+    feast_status: str = "live"
     request_id: str
 
 
 class ValidationErrorResponse(BaseModel):
     detail: dict
+
+def get_ctx(request: Request) -> AppState:
+    """FastAPI dependency — injects the app-scoped state into any route."""
+    return request.app.state.ctx
 
 # Routes
 
@@ -152,8 +214,9 @@ class ValidationErrorResponse(BaseModel):
     response_model=PredictionResponse,
     responses={400: {"model": ValidationErrorResponse}},
     tags=["Prediction"],
+    dependencies=[Depends(verify_api_key)]
 )
-def predict(tx: Transaction, request: Request):
+def predict(tx: Transaction, request: Request, background_tasks: BackgroundTasks, ctx: AppState = Depends(get_ctx)):
     """
     Score a transaction for fraud.
 
@@ -166,7 +229,7 @@ def predict(tx: Transaction, request: Request):
     logger.info("Prediction request [request_id=%s] payload=%s", request_id, data)
 
     # Validation
-    validation = validate_transaction(data, state.valid_categories)
+    validation = validate_transaction(data, ctx.valid_categories)
     if not validation["valid"]:
         logger.warning(
             "Validation failed [request_id=%s] errors=%s",
@@ -183,7 +246,12 @@ def predict(tx: Transaction, request: Request):
 
     # Feature engineering
     try:
-        feast_features = get_online_features(data["merchant_category"])
+        feast_features, feast_ok = get_online_features(data["merchant_category"])
+        if not feast_ok:
+            logger.warning(
+                "Using Feast fallback defaults [request_id=%s] merchant_category=%r",
+                request_id, data["merchant_category"],
+            )
     except Exception:
         logger.exception("Feast feature fetch failed [request_id=%s]", request_id)
         raise HTTPException(
@@ -192,7 +260,7 @@ def predict(tx: Transaction, request: Request):
         )
 
     try:
-        data["merchant_encoded"] = state.encoder.transform([data["merchant_category"]])[0]
+        data["merchant_encoded"] = ctx.encoder.transform([data["merchant_category"]])[0]
     except Exception:
         logger.exception("Encoder transform failed [request_id=%s]", request_id)
         raise HTTPException(
@@ -212,8 +280,8 @@ def predict(tx: Transaction, request: Request):
 
     # Inference
     try:
-        pred = state.model.predict(X)[0]
-        prob = float(state.model.predict_proba(X)[0][1])
+        pred = ctx.model.predict(X)[0]
+        prob = float(ctx.model.predict_proba(X)[0][1])
     except Exception:
         logger.exception("Model inference failed [request_id=%s]", request_id)
         raise HTTPException(
@@ -226,20 +294,36 @@ def predict(tx: Transaction, request: Request):
         request_id, bool(pred), prob,
     )
 
+    background_tasks.add_task(
+        persist_prediction,
+        request_id=request_id,
+        amount=data["amount"],
+        hour=data["hour"],
+        day_of_week=data["day_of_week"],
+        merchant_category=data["merchant_category"],
+        feast_features=feast_features,
+        feast_status="live" if feast_ok else "fallback",
+        is_fraud=bool(pred),
+        fraud_probability=round(prob, 4),
+        model_version=ctx.model_version,
+        model_source="MLflow Production",
+    )
+
     return PredictionResponse(
         is_fraud=bool(pred),
         fraud_probability=round(prob, 4),
         validation_passed=True,
+        feast_status="live" if feast_ok else "fallback",
         model_source="MLflow Production",
-        model_version=state.model_version,
+        model_version=ctx.model_version,
         request_id=request_id,
     )
 
 
 @app.get("/health", tags=["Ops"])
-def health():
+def health(ctx: AppState = Depends(get_ctx)):
     """Liveness probe. Returns 503 if the model is not loaded."""
-    if state.model is None or state.encoder is None:
+    if ctx.model is None or ctx.encoder is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model or encoder not loaded.",
@@ -247,20 +331,20 @@ def health():
     return {
         "status": "healthy",
         "validation": "enabled",
-        "model_version": state.model_version,
-        "loaded_at": state.loaded_at,
+        "model_version": ctx.model_version,
+        "loaded_at": ctx.loaded_at,
     }
 
 
 @app.get("/model-info", tags=["Ops"])
-def model_info():
+def model_info(ctx: AppState = Depends(get_ctx)):
     """Returns metadata about the currently loaded model."""
     return {
         "registry":      "MLflow",
         "model_name":    "fraud-detection-model",
         "alias":         "champion",
-        "model_version": state.model_version,
+        "model_version": ctx.model_version,
         "tracking_uri":  mlflow.get_tracking_uri(),
-        "loaded_at":     state.loaded_at,
-        "valid_categories": sorted(state.valid_categories),
+        "loaded_at":     ctx.loaded_at,
+        "valid_categories": sorted(ctx.valid_categories),
     }

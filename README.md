@@ -7,28 +7,28 @@ A production-grade, end-to-end MLOps pipeline for real-time credit card fraud de
 ## Architecture
 
 ```
-┌──────────────┐     ┌────────────────────┐     ┌─────────────────┐
-│  Synthetic   │────▶│  Data Validation  │────▶│  Model Training  │
-│  Data Gen    │     │  (Great Expects.)  │     │  (scikit-learn)  │
-└──────────────┘     └────────────────────┘     └────────┬────────┘
-                                                        │
-                     ┌──────────────────┐               │
-                     │  Feature Store    │◀──────────────┤
-                     │  (Feast)          │               │
-                     └──────┬───────────┘               ▼
+┌──────────────┐     ┌────────────────────┐     ┌───────────────────┐
+│  Synthetic   │────▶│  Data Validation  │────▶│   Model Training  │
+│  Data Gen    │     │  (Great Expects.)  │     │   (scikit-learn)  │
+└──────────────┘     └────────────────────┘     └────────┬──────────┘
+                                                         │
+                     ┌──────────────────┐                │
+                     │  Feature Store   │◀────────────┤
+                     │  (Feast)         │              │
+                     └──────┬───────────┘              ▼
                             │               ┌─────────────────┐
-                            │               │  Experiment      │
-                            │               │  Tracking        │
-                            │               │  (MLflow)        │
+                            │               │  Experimen      │
+                            │               │  Tracking       │
+                            │               │  (MLflow)       │
                             │               └────────┬────────┘
                             │                        │
                             ▼                        ▼
-                     ┌──────────────────┐   ┌─────────────────┐
-                     │  Online Features  │──▶│  Model Serving   │
-                     │  (low-latency)    │   │  (FastAPI)       │
-                     └──────────────────┘   └────────┬────────┘
-                                                      │
-                     ┌──────────────────┐             │
+                     ┌──────────────────┐    ┌─────────────────┐
+                     │  Online Features  │──▶│  Model Serving  │
+                     │  (low-latency)    │    │  (FastAPI)       │
+                     └──────────────────┘     └────────┬────────┘
+                                                       │
+                     ┌──────────────────┐              │
                      │  Drift Detection  │◀────────────┘
                      │  (Evidently AI)   │
                      └──────────────────┘

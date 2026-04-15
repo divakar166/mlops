@@ -6,14 +6,17 @@ from datetime import datetime
 import subprocess
 import os
 
-def compute_merchant_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_merchant_features(df: pd.DataFrame, split: str = "train") -> pd.DataFrame:
+    if split != "train":
+        raise ValueError("Merchant stats must only be computed from the training split.")
     print("Computing merchant-level features...")
     
     # Group by merchant category and compute aggregates
-    stats = df.groupby('merchant_category').agg({
-        'amount': ['mean', 'count'],
-        'is_fraud': 'mean'
-    }).reset_index()
+    stats = df.groupby("merchant_category").agg(
+        avg_amount=("amount", "mean"),
+        transaction_count=("amount", "count"),
+        fraud_rate=("is_fraud", "mean"),
+    ).reset_index()
     
     # Flatten column names
     stats.columns = ['merchant_category', 'avg_amount', 'transaction_count', 'fraud_rate']
@@ -39,7 +42,7 @@ def main():
     
     # Compute merchant features
     print("\n2. Computing merchant features...")
-    merchant_features = compute_merchant_features(train_df)
+    merchant_features = compute_merchant_features(train_df, split="train")
     
     print("\n   Computed features:")
     print(merchant_features.to_string(index=False))
