@@ -3,6 +3,7 @@ import uuid
 import logging
 import pickle
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import mlflow
 import mlflow.sklearn
@@ -19,9 +20,10 @@ from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
 
-from src.data_validation import validate_transaction
-from src.feast_feature import get_online_features, get_store
-from src.db import init_pool, close_pool, persist_prediction
+from app.data_validation import validate_transaction
+from app.feast_feature import get_online_features, get_store
+from app.db import init_pool, close_pool, persist_prediction
+from app.monitoring import DriftMonitor
 
 load_dotenv()
 
@@ -32,14 +34,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fraud_detection")
 
-class AppState(BaseModel):
-    model: object = None
-    encoder: object = None
-    valid_categories: set[str] = set()
-    model_version: str = "unknown"
-    loaded_at: float = 0.0
+@dataclass
+class AppState:
+    model:             object             = None
+    encoder:           object             = None
+    valid_categories:  set[str]           = field(default_factory=set)
+    model_version:     str                = "unknown"
+    loaded_at:         float              = 0.0
+    drift_monitor:     DriftMonitor|None  = None
 
-API_KEY = os.environ.get("FRAUD_API_KEY", None)
+API_KEY = os.getenv("FRAUD_API_KEY", None)
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 async def verify_api_key(
@@ -48,10 +52,7 @@ async def verify_api_key(
 ) -> str:
     """Reusable dependency — raises 401/403 on bad/missing key."""
     if not API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server auth not configured.",
-        )
+        raise HTTPException(status_code=500, detail="Server auth not configured.")
     if key is None:
         logger.warning("Missing API key [request_id=%s]", getattr(request.state, "request_id", "unknown"))
         raise HTTPException(
@@ -60,14 +61,8 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
     if key != API_KEY:
-        logger.warning(
-            "Invalid API key attempt [request_id=%s]",
-            getattr(request.state, "request_id", "unknown"),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API key.",
-        )
+        logger.warning("Invalid API key [request_id=%s]", getattr(request.state, "request_id", "unknown"))
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key.")
     return key
 
 def get_api_key_for_limiting(request: Request) -> str:
@@ -77,10 +72,7 @@ def get_api_key_for_limiting(request: Request) -> str:
         return hashlib.sha256(key.encode()).hexdigest()[:16]
     return get_remote_address(request)
 
-limiter = Limiter(
-    key_func=get_api_key_for_limiting,
-    default_limits=["200/minute"],
-)
+limiter = Limiter(key_func=get_api_key_for_limiting, default_limits=["200/minute"])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,10 +86,10 @@ async def lifespan(app: FastAPI):
     if missing:
         raise RuntimeError(f"Missing required environment variables: {missing}")
     
-    tracking_uri = "http://localhost:5000"
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
     model_uri    = "models:/fraud-detection-model@champion"
     mlflow.set_tracking_uri(tracking_uri)
-    logger.info("MLflow tracking URI set to %s", tracking_uri)
+    logger.info("MLflow tracking URI: %s", tracking_uri)
 
     try:
         ctx.model = mlflow.sklearn.load_model(model_uri)
@@ -145,9 +137,20 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to initialize DB pool — aborting startup")
         raise
 
+    try:
+        reference_path = os.getenv("REFERENCE_DATA_PATH", "data/train.csv")
+        ref_df = pd.read_csv(reference_path)
+        ctx.drift_monitor = DriftMonitor(
+            reference_data=ref_df,
+            feature_columns=["amount", "hour", "day_of_week"],
+        )
+        logger.info("DriftMonitor initialized with %d reference rows", len(ref_df))
+    except Exception:
+        logger.warning("Could not initialize DriftMonitor — drift checks will be skipped")
+        ctx.drift_monitor = None
+
     ctx.loaded_at = time.time()
-    elapsed = time.perf_counter() - t0
-    logger.info("Startup complete in %.3fs", elapsed)
+    logger.info("Startup complete in %.3fs", time.perf_counter() - t0)
 
     yield
 
@@ -175,10 +178,7 @@ async def request_logging_middleware(request: Request, call_next):
     request.state.request_id = request_id
     t0 = time.perf_counter()
 
-    logger.info(
-        "REQUEST  id=%s method=%s path=%s",
-        request_id, request.method, request.url.path,
-    )
+    logger.info("REQUEST  id=%s method=%s path=%s", request_id, request.method, request.url.path)
 
     response = await call_next(request)
 
@@ -202,6 +202,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
+def get_ctx(request: Request) -> AppState:
+    return request.app.state.ctx
+
 # Schemas
 
 class Transaction(BaseModel):
@@ -224,27 +227,30 @@ class PredictionResponse(BaseModel):
 class ValidationErrorResponse(BaseModel):
     detail: dict
 
-def get_ctx(request: Request) -> AppState:
-    """FastAPI dependency — injects the app-scoped state into any route."""
-    return request.app.state.ctx
-
 # Routes
 
 @app.post(
     "/predict",
     response_model=PredictionResponse,
-    responses={400: {"model": ValidationErrorResponse}},
+    responses={
+        400: {"model": ValidationErrorResponse},
+        401: {"description": "Missing API key"},
+        403: {"description": "Invalid API key"},
+        429: {"description": "Rate limit exceeded"},
+    },
     tags=["Prediction"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 @limiter.limit("30/minute")
-def predict(tx: Transaction, request: Request, response: Response, background_tasks: BackgroundTasks, ctx: AppState = Depends(get_ctx)):
+def predict(
+    tx: Transaction,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    ctx: AppState = Depends(get_ctx),
+):
     """
     Score a transaction for fraud.
-
-    - Validates input fields before inference.
-    - Enriches features from the Feast online store.
-    - Returns fraud probability from the MLflow champion model.
     """
     request_id = getattr(request.state, "request_id", "unknown")
     data = tx.model_dump()
@@ -253,42 +259,22 @@ def predict(tx: Transaction, request: Request, response: Response, background_ta
     # Validation
     validation = validate_transaction(data, ctx.valid_categories)
     if not validation["valid"]:
-        logger.warning(
-            "Validation failed [request_id=%s] errors=%s",
-            request_id, validation["errors"],
-        )
+        logger.warning("Validation failed [request_id=%s] errors=%s", request_id, validation["errors"])
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Validation failed",
-                "errors": validation["errors"],
-                "input": data,
-            },
+            detail={"message": "Validation failed", "errors": validation["errors"], "input": data},
         )
 
-    # Feature engineering
-    try:
-        feast_features, feast_ok = get_online_features(data["merchant_category"])
-        if not feast_ok:
-            logger.warning(
-                "Using Feast fallback defaults [request_id=%s] merchant_category=%r",
-                request_id, data["merchant_category"],
-            )
-    except Exception:
-        logger.exception("Feast feature fetch failed [request_id=%s]", request_id)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Feature store unavailable — please retry.",
-        )
+    # Feast features
+    feast_features, feast_ok = get_online_features(data["merchant_category"])
+    if not feast_ok:
+        logger.warning("Feast fallback [request_id=%s] merchant=%r", request_id, data["merchant_category"])
 
     try:
         data["merchant_encoded"] = ctx.encoder.transform([data["merchant_category"]])[0]
     except Exception:
         logger.exception("Encoder transform failed [request_id=%s]", request_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Feature encoding error.",
-        )
+        raise HTTPException(status_code=500, detail="Feature encoding error.")
 
     X = pd.DataFrame([{
         "amount":            data["amount"],
@@ -306,15 +292,9 @@ def predict(tx: Transaction, request: Request, response: Response, background_ta
         prob = float(ctx.model.predict_proba(X)[0][1])
     except Exception:
         logger.exception("Model inference failed [request_id=%s]", request_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Model inference error.",
-        )
+        raise HTTPException(status_code=500, detail="Model inference error.")
 
-    logger.info(
-        "Prediction result [request_id=%s] is_fraud=%s probability=%.4f",
-        request_id, bool(pred), prob,
-    )
+    logger.info("Prediction [request_id=%s] is_fraud=%s probability=%.4f", request_id, bool(pred), prob)
 
     background_tasks.add_task(
         persist_prediction,
@@ -331,6 +311,13 @@ def predict(tx: Transaction, request: Request, response: Response, background_ta
         model_source="MLflow Production",
     )
 
+    if ctx.drift_monitor is not None:
+        background_tasks.add_task(
+            _run_drift_check,
+            ctx.drift_monitor,
+            pd.DataFrame([{"amount": data["amount"], "hour": data["hour"], "day_of_week": data["day_of_week"]}]),
+        )
+
     return PredictionResponse(
         is_fraud=bool(pred),
         fraud_probability=round(prob, 4),
@@ -341,33 +328,88 @@ def predict(tx: Transaction, request: Request, response: Response, background_ta
         request_id=request_id,
     )
 
+def _run_drift_check(monitor: DriftMonitor, row: pd.DataFrame) -> None:
+    """Called in background — silently accumulates drift stats, never raises."""
+    try:
+        monitor.check_drift(row)
+    except Exception:
+        logger.exception("Background drift check failed — continuing")
+
+@app.get("/monitoring/drift", tags=["Monitoring"])
+def drift_summary(ctx: AppState = Depends(get_ctx)):
+    """Returns drift check history and summary stats."""
+    if ctx.drift_monitor is None:
+        raise HTTPException(status_code=503, detail="Drift monitor not available.")
+    return {
+        "summary": ctx.drift_monitor.summary(),
+        "alerts":  ctx.drift_monitor.get_alerts(),
+        "history": ctx.drift_monitor.history[-50:],   # last 50 checks
+    }
+
+
+# FIX: was @app.post — Streamlit calls this with a GET request, so it must be @app.get.
+@app.get("/monitoring/drift/check", tags=["Monitoring"])
+def run_drift_check(
+    ctx: AppState = Depends(get_ctx),
+    window: int = 100,
+):
+    """
+    Run a batch drift check against the last `window` rows from the DB.
+    Useful for scheduled or manual checks.
+    """
+    if ctx.drift_monitor is None:
+        raise HTTPException(status_code=503, detail="Drift monitor not available.")
+
+    from app.db import get_recent_predictions
+    rows = get_recent_predictions(limit=window)
+    if not rows:
+        return {"message": "No predictions in DB yet — cannot run drift check."}
+
+    current_df = pd.DataFrame(rows)
+    result = ctx.drift_monitor.check_drift(current_df)
+    return result
+
+
+@app.get("/monitoring/stats", tags=["Monitoring"])
+def prediction_stats(ctx: AppState = Depends(get_ctx)):
+    """Returns live prediction stats from the DB."""
+    from app.db import get_prediction_stats
+    return get_prediction_stats()
+
+
+# FIX: this endpoint was missing entirely — Streamlit's "Recent Predictions" tab
+# calls GET /monitoring/recent?limit=N, which was returning 404.
+@app.get("/monitoring/recent", tags=["Monitoring"])
+def recent_predictions(
+    ctx: AppState = Depends(get_ctx),
+    limit: int = 100,
+):
+    """Returns the most recent `limit` predictions from the DB."""
+    from app.db import get_recent_predictions
+    return get_recent_predictions(limit=limit)
+
 
 @app.get("/health", tags=["Ops"])
 @limiter.exempt
 def health(ctx: AppState = Depends(get_ctx)):
-    """Liveness probe. Returns 503 if the model is not loaded."""
     if ctx.model is None or ctx.encoder is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model or encoder not loaded.",
-        )
+        raise HTTPException(status_code=503, detail="Model or encoder not loaded.")
     return {
-        "status": "healthy",
-        "validation": "enabled",
-        "model_version": ctx.model_version,
-        "loaded_at": ctx.loaded_at,
+        "status":           "healthy",
+        "model_version":    ctx.model_version,
+        "loaded_at":        ctx.loaded_at,
+        "drift_monitor":    ctx.drift_monitor is not None,
     }
 
 
-@app.get("/model-info", tags=["Ops"])
+@app.get("/model-info", tags=["Ops"], dependencies=[Depends(verify_api_key)])
 def model_info(ctx: AppState = Depends(get_ctx)):
-    """Returns metadata about the currently loaded model."""
     return {
-        "registry":      "MLflow",
-        "model_name":    "fraud-detection-model",
-        "alias":         "champion",
-        "model_version": ctx.model_version,
-        "tracking_uri":  mlflow.get_tracking_uri(),
-        "loaded_at":     ctx.loaded_at,
+        "registry":         "MLflow",
+        "model_name":       "fraud-detection-model",
+        "alias":            "champion",
+        "model_version":    ctx.model_version,
+        "tracking_uri":     mlflow.get_tracking_uri(),
+        "loaded_at":        ctx.loaded_at,
         "valid_categories": sorted(ctx.valid_categories),
     }

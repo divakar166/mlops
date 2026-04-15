@@ -1,8 +1,10 @@
 import logging
 import os
 from datetime import datetime, timezone
+from typing import List, Dict, Any
 
 from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 
 logger = logging.getLogger("fraud_detection.db")
 
@@ -34,6 +36,9 @@ CREATE TABLE IF NOT EXISTS predictions (
     model_version    TEXT,
     model_source     TEXT
 );
+
+CREATE INDEX IF NOT EXISTS predictions_predicted_at_idx
+    ON predictions (predicted_at DESC);
 """
 
 INSERT_SQL = """
@@ -57,7 +62,7 @@ ON CONFLICT (request_id) DO NOTHING;
 def init_pool(min_conn: int = 1, max_conn: int = 10) -> None:
     """Create the connection pool and ensure the table exists. Call once at startup."""
     global _pool
-    dsn = os.environ.get("DATABASE_URL", None)  # e.g. postgresql://user:pass@host:5432/fraud
+    dsn = os.environ.get("DATABASE_URL", None)
     if not dsn:
         raise RuntimeError(
             "DATABASE_URL environment variable is not set. "
@@ -127,5 +132,69 @@ def persist_prediction(
         logger.debug("Persisted prediction [request_id=%s]", request_id)
     except Exception:
         logger.exception("Failed to persist prediction [request_id=%s] — continuing", request_id)
+    finally:
+        _pool.putconn(conn)
+
+
+def get_recent_predictions(limit: int = 100) -> List[Dict[str, Any]]:
+    if _pool is None:
+        return []
+    conn = _pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM predictions ORDER BY predicted_at DESC LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Failed to fetch recent predictions")
+        return []
+    finally:
+        _pool.putconn(conn)
+
+
+def get_prediction_stats() -> Dict[str, Any]:
+    if _pool is None:
+        return {}
+    conn = _pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                        AS total,
+                    SUM(is_fraud::int)                             AS total_fraud,
+                    ROUND(AVG(is_fraud::int) * 100, 2)             AS fraud_rate_pct,
+                    ROUND(AVG(fraud_probability)  * 100, 2)        AS avg_fraud_prob_pct,
+                    ROUND(AVG(amount)::numeric,   2)               AS avg_amount,
+                    SUM(CASE WHEN feast_status = 'fallback'
+                             THEN 1 ELSE 0 END)                    AS feast_fallbacks
+                FROM predictions
+            """)
+            row = cur.fetchone()
+
+            cur.execute("""
+                SELECT merchant_category,
+                       COUNT(*)                            AS count,
+                       ROUND(AVG(is_fraud::int) * 100, 2) AS fraud_rate_pct
+                FROM predictions
+                GROUP BY merchant_category
+                ORDER BY count DESC
+            """)
+            by_category = cur.fetchall()
+
+        return {
+            "total":              row["total"]              or 0,
+            "total_fraud":        row["total_fraud"]        or 0,
+            "fraud_rate_pct":     row["fraud_rate_pct"]     or 0.0,
+            "avg_fraud_prob_pct": row["avg_fraud_prob_pct"] or 0.0,
+            "avg_amount":         row["avg_amount"]         or 0.0,
+            "feast_fallbacks":    row["feast_fallbacks"]    or 0,
+            "by_category":        [dict(r) for r in by_category],
+        }
+    except Exception:
+        logger.exception("Failed to fetch prediction stats")
+        return {}
     finally:
         _pool.putconn(conn)

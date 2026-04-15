@@ -18,4 +18,5 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "scipy>=1.15.3",
     "slowapi>=0.1.9",
+    "streamlit>=1.56.0",
 ]
