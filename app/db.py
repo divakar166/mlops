@@ -1,7 +1,9 @@
 import logging
 import os
+import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any
+from app.config import settings
 
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -10,7 +12,7 @@ logger = logging.getLogger("fraud_detection.db")
 
 _pool: pool.ThreadedConnectionPool | None = None
 
-CREATE_TABLE_SQL = """
+CREATE_PREDICTIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS predictions (
     id               BIGSERIAL PRIMARY KEY,
     request_id       TEXT        NOT NULL UNIQUE,
@@ -41,6 +43,33 @@ CREATE INDEX IF NOT EXISTS predictions_predicted_at_idx
     ON predictions (predicted_at DESC);
 """
 
+CREATE_DRIFT_RESULTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS drift_results (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Window metadata
+    window_size     INTEGER      NOT NULL,
+    current_samples INTEGER      NOT NULL,
+
+    -- Drift summary
+    drift_share     NUMERIC(8, 6) NOT NULL,
+    n_features      INTEGER       NOT NULL,
+    n_drifted       INTEGER       NOT NULL,
+    alert           BOOLEAN       NOT NULL,
+
+    -- Threshold used
+    threshold       NUMERIC(8, 6) NOT NULL,
+
+    -- Columns and stats (JSON blobs)
+    drifted_columns JSONB         NOT NULL,
+    column_stats    JSONB         NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS drift_results_created_at_idx
+    ON drift_results (created_at DESC);
+"""
+
 INSERT_SQL = """
 INSERT INTO predictions (
     request_id, predicted_at,
@@ -59,17 +88,14 @@ ON CONFLICT (request_id) DO NOTHING;
 """
 
 
-def init_pool(min_conn: int = 1, max_conn: int = 10) -> None:
+def init_pool(min_conn: int | None = None, max_conn: int | None = None) -> None:
     """Create the connection pool and ensure the table exists. Call once at startup."""
     global _pool
-    dsn = os.environ.get("DATABASE_URL", None)
-    if not dsn:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set. "
-            "Set it before starting the server."
-        )
-    _pool = pool.ThreadedConnectionPool(min_conn, max_conn, dsn)
-    logger.info("DB connection pool created (min=%d max=%d)", min_conn, max_conn)
+    dsn = settings.DATABASE_URL
+    min_c = min_conn or settings.DB_MIN_CONN
+    max_c = max_conn or settings.DB_MAX_CONN
+    _pool = pool.ThreadedConnectionPool(min_c, max_c, dsn)
+    logger.info("DB connection pool created (min=%d max=%d)", min_c, max_c)
     _ensure_table()
 
 
@@ -86,8 +112,9 @@ def _ensure_table() -> None:
     conn = _pool.getconn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(CREATE_TABLE_SQL)
-        logger.info("predictions table ready")
+            cur.execute(CREATE_PREDICTIONS_TABLE_SQL)
+            cur.execute(CREATE_DRIFT_RESULTS_TABLE_SQL)
+        logger.info("predictions and drift_results tables ready")
     finally:
         _pool.putconn(conn)
 
@@ -196,5 +223,99 @@ def get_prediction_stats() -> Dict[str, Any]:
     except Exception:
         logger.exception("Failed to fetch prediction stats")
         return {}
+    finally:
+        _pool.putconn(conn)
+
+def persist_drift_result(*, result: Dict[str, Any], window_size: int) -> None:
+    if _pool is None:
+        logger.warning("DB pool not initialized — skipping drift persist")
+        return
+
+    conn = _pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO drift_results (
+                    created_at,
+                    window_size, current_samples,
+                    drift_share, n_features, n_drifted, alert,
+                    threshold,
+                    drifted_columns, column_stats
+                ) VALUES (
+                    %(created_at)s,
+                    %(window_size)s, %(current_samples)s,
+                    %(drift_share)s, %(n_features)s, %(n_drifted)s, %(alert)s,
+                    %(threshold)s,
+                    %(drifted_columns)s, %(column_stats)s
+                )
+                """,
+                {
+                    "created_at":      datetime.fromisoformat(result["timestamp"]),
+                    "window_size":     window_size,
+                    "current_samples": result["current_samples"],
+                    "drift_share":     result["drift_share"],
+                    "n_features":      result["n_features"],
+                    "n_drifted":       result["n_drifted"],
+                    "alert":           result["alert"],
+                    "threshold":       result["threshold"],
+                    "drifted_columns": json.dumps(result["drifted_columns"]),
+                    "column_stats":    json.dumps(result["column_stats"]),
+                },
+            )
+        logger.debug("Persisted drift result window=%d drift_share=%.4f", window_size, result["drift_share"])
+    except Exception:
+        logger.exception("Failed to persist drift result — continuing")
+    finally:
+        _pool.putconn(conn)
+
+def get_drift_history(limit: int = 50) -> List[Dict[str, Any]]:
+    if _pool is None:
+        return []
+
+    conn = _pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    created_at,
+                    window_size,
+                    current_samples,
+                    drift_share,
+                    n_features,
+                    n_drifted,
+                    alert,
+                    threshold,
+                    drifted_columns,
+                    column_stats
+                FROM drift_results
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        # Convert JSONB -> Python
+        history = []
+        for r in rows:
+            history.append(
+                {
+                    "timestamp":       r["created_at"].isoformat(),
+                    "window_size":     r["window_size"],
+                    "current_samples": r["current_samples"],
+                    "drift_share":     float(r["drift_share"]),
+                    "n_features":      r["n_features"],
+                    "n_drifted":       r["n_drifted"],
+                    "alert":           r["alert"],
+                    "threshold":       float(r["threshold"]),
+                    "drifted_columns": r["drifted_columns"],
+                    "column_stats":    r["column_stats"],
+                }
+            )
+        return history
+    except Exception:
+        logger.exception("Failed to fetch drift history")
+        return []
     finally:
         _pool.putconn(conn)

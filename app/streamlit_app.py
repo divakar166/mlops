@@ -81,13 +81,13 @@ with tab_predict:
         st.caption("Quick scenarios")
         preset_cols = st.columns(3)
         with preset_cols[0]:
-            if st.button("Legit", use_container_width=True):
+            if st.button("Legit", width='content'):
                 st.session_state["preset"] = {"amount": 45.0, "hour": 14, "dow": 2, "merchant": "grocery"}
         with preset_cols[1]:
-            if st.button("Suspicious", use_container_width=True):
+            if st.button("Suspicious", width='content'):
                 st.session_state["preset"] = {"amount": 850.0, "hour": 2, "dow": 6, "merchant": "online"}
         with preset_cols[2]:
-            if st.button("High Risk", use_container_width=True):
+            if st.button("High Risk", width='content'):
                 st.session_state["preset"] = {"amount": 2400.0, "hour": 3, "dow": 0, "merchant": "travel"}
 
         # Apply preset if clicked
@@ -98,7 +98,7 @@ with tab_predict:
             dow      = p["dow"]
             merchant = p["merchant"]
 
-        score_btn = st.button("Score Transaction", type="primary", use_container_width=True)
+        score_btn = st.button("Score Transaction", type="primary", width='content')
 
     with col_result:
         st.subheader("Prediction Result")
@@ -141,14 +141,14 @@ with tab_predict:
                     },
                 ))
                 fig.update_layout(height=260, margin=dict(t=40, b=0, l=20, r=20))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='content')
 
                 # Metadata
                 meta_cols = st.columns(2)
                 meta_cols[0].metric("Fraud Probability", f"{prob*100:.2f}%")
                 meta_cols[1].metric("Model Version", result.get("model_version", "—"))
                 meta_cols[0].metric("Feast Status", result.get("feast_status", "—"))
-                meta_cols[1].metric("Request ID", result.get("request_id", "—")[:8] + "…")
+                meta_cols[1].metric("Decision Threshold", f"{result.get('decision_threshold', 0.30):.2f}")
         else:
             st.info("Fill in transaction details and click **Score Transaction**.")
 
@@ -168,7 +168,7 @@ with tab_predict:
                 },
             ))
             fig.update_layout(height=260, margin=dict(t=40, b=0, l=20, r=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='content')
 
 
 # TAB 2 — MONITORING
@@ -204,7 +204,7 @@ with tab_monitor:
                     labels={"merchant_category": "Category", "count": "Predictions", "fraud_rate_pct": "Fraud %"},
                 )
                 fig.update_layout(height=280, margin=dict(t=20, b=20), coloraxis_showscale=True)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='content')
             with col_pie:
                 st.caption("**Fraud rate by category**")
                 fig2 = px.bar(
@@ -214,7 +214,7 @@ with tab_monitor:
                     labels={"merchant_category": "Category", "fraud_rate_pct": "Fraud Rate (%)"},
                 )
                 fig2.update_layout(height=280, margin=dict(t=20, b=20))
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width='content')
 
     st.divider()
 
@@ -260,7 +260,7 @@ with tab_monitor:
                 fig.add_hline(y=10, line_dash="dash", line_color="orange", annotation_text="Alert threshold (10%)")
                 fig.add_hline(y=30, line_dash="dash", line_color="red",    annotation_text="High severity (30%)")
                 fig.update_layout(height=320, margin=dict(t=40, b=20))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='content')
             else:
                 st.info("No drift history yet. Predictions will accumulate drift checks automatically.")
 
@@ -271,7 +271,7 @@ with tab_monitor:
             window = st.number_input("Rows to check", min_value=10, max_value=1000, value=100, step=10)
         with col_btn:
             st.write("")   # vertical alignment spacer
-            if st.button("Run Batch Drift Check", use_container_width=True):
+            if st.button("Run Batch Drift Check", width='content'):
                 with st.spinner("Running drift check…"):
                     result, err = api_get(f"/monitoring/drift/check?window={window}")
                 if err:
@@ -327,7 +327,7 @@ with tab_recent:
 
         st.dataframe(
             df[display_cols].style.apply(highlight_fraud, axis=1),
-            use_container_width=True,
+            width='content',
             height=500,
         )
         st.caption(f"Showing {len(df)} rows  |  🔴 = fraud flagged")

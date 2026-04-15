@@ -17,15 +17,12 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.errors import RateLimitExceeded
 from starlette.responses import Response
 from pydantic import BaseModel, Field
-import os
-from dotenv import load_dotenv
+from app.config import settings
 
 from app.data_validation import validate_transaction
 from app.feast_feature import get_online_features, get_store
-from app.db import init_pool, close_pool, persist_prediction
+from app.db import init_pool, close_pool, persist_prediction, get_drift_history, persist_drift_result, get_recent_predictions
 from app.monitoring import DriftMonitor
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +40,8 @@ class AppState:
     loaded_at:         float              = 0.0
     drift_monitor:     DriftMonitor|None  = None
 
-API_KEY = os.getenv("FRAUD_API_KEY", None)
+FRAUD_THRESHOLD = settings.FRAUD_THRESHOLD
+API_KEY = settings.FRAUD_API_KEY
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 async def verify_api_key(
@@ -72,7 +70,10 @@ def get_api_key_for_limiting(request: Request) -> str:
         return hashlib.sha256(key.encode()).hexdigest()[:16]
     return get_remote_address(request)
 
-limiter = Limiter(key_func=get_api_key_for_limiting, default_limits=["200/minute"])
+limiter = Limiter(
+    key_func=get_api_key_for_limiting,
+    default_limits=[settings.RATE_LIMIT_DEFAULT],
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,12 +83,12 @@ async def lifespan(app: FastAPI):
     t0 = time.perf_counter()
     logger.info("Starting up fraud-detection service …")
 
-    missing = [v for v in ("FRAUD_API_KEY", "DATABASE_URL") if not os.getenv(v)]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {missing}")
+    # missing = [v for v in ("FRAUD_API_KEY", "DATABASE_URL") if not os.getenv(v)]
+    # if missing:
+    #     raise RuntimeError(f"Missing required environment variables: {missing}")
     
-    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-    model_uri    = "models:/fraud-detection-model@champion"
+    tracking_uri = settings.MLFLOW_TRACKING_URI
+    model_uri = f"models:/{settings.MLFLOW_MODEL_NAME}@{settings.MLFLOW_MODEL_ALIAS}"
     mlflow.set_tracking_uri(tracking_uri)
     logger.info("MLflow tracking URI: %s", tracking_uri)
 
@@ -102,6 +103,25 @@ async def lifespan(app: FastAPI):
         client = mlflow.MlflowClient()
         mv = client.get_model_version_by_alias("fraud-detection-model", "champion")
         ctx.model_version = mv.version
+
+        run = client.get_run(mv.run_id)
+        optimal_thr = run.data.params.get("optimal_threshold")
+
+        global FRAUD_THRESHOLD
+        if optimal_thr is not None:
+            FRAUD_THRESHOLD = float(optimal_thr)
+            logger.info(
+                "Loaded optimal_threshold=%.3f from MLflow run %s",
+                FRAUD_THRESHOLD,
+                mv.run_id,
+            )
+        else:
+            logger.warning(
+                "No optimal_threshold param on run %s — using FRAUD_THRESHOLD=%s",
+                mv.run_id,
+                FRAUD_THRESHOLD,
+            )
+
         logger.info("Model version: %s (run_id=%s)", mv.version, mv.run_id)
     except Exception:
         logger.warning("Could not fetch model version metadata — continuing anyway")
@@ -131,14 +151,7 @@ async def lifespan(app: FastAPI):
         raise
 
     try:
-        init_pool(min_conn=1, max_conn=10)
-        logger.info("DB pool initialized")
-    except Exception:
-        logger.exception("Failed to initialize DB pool — aborting startup")
-        raise
-
-    try:
-        reference_path = os.getenv("REFERENCE_DATA_PATH", "data/train.csv")
+        reference_path = settings.REFERENCE_DATA_PATH
         ref_df = pd.read_csv(reference_path)
         ctx.drift_monitor = DriftMonitor(
             reference_data=ref_df,
@@ -148,6 +161,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Could not initialize DriftMonitor — drift checks will be skipped")
         ctx.drift_monitor = None
+
+    try:
+        init_pool(min_conn=settings.DB_MIN_CONN, max_conn=settings.DB_MAX_CONN)
+        logger.info("DB pool initialized (min=%d, max=%d)", settings.DB_MIN_CONN, settings.DB_MAX_CONN)
+    except Exception:
+        logger.exception("Failed to initialize DB pool — aborting startup")
+        raise
 
     ctx.loaded_at = time.time()
     logger.info("Startup complete in %.3fs", time.perf_counter() - t0)
@@ -217,6 +237,7 @@ class Transaction(BaseModel):
 class PredictionResponse(BaseModel):
     is_fraud: bool
     fraud_probability: float
+    decision_threshold: float = FRAUD_THRESHOLD
     model_source: str = "MLflow Production"
     model_version: str
     validation_passed: bool = True
@@ -241,7 +262,7 @@ class ValidationErrorResponse(BaseModel):
     tags=["Prediction"],
     dependencies=[Depends(verify_api_key)],
 )
-@limiter.limit("30/minute")
+@limiter.limit(settings.RATE_LIMIT_PREDICT)
 def predict(
     tx: Transaction,
     request: Request,
@@ -288,13 +309,19 @@ def predict(
 
     # Inference
     try:
-        pred = ctx.model.predict(X)[0]
         prob = float(ctx.model.predict_proba(X)[0][1])
+        is_fraud = prob >= FRAUD_THRESHOLD
     except Exception:
         logger.exception("Model inference failed [request_id=%s]", request_id)
         raise HTTPException(status_code=500, detail="Model inference error.")
 
-    logger.info("Prediction [request_id=%s] is_fraud=%s probability=%.4f", request_id, bool(pred), prob)
+    logger.info(
+        "Prediction [request_id=%s] is_fraud=%s probability=%.4f threshold=%.2f",
+        request_id,
+        is_fraud,
+        prob,
+        FRAUD_THRESHOLD,
+    )
 
     background_tasks.add_task(
         persist_prediction,
@@ -305,22 +332,16 @@ def predict(
         merchant_category=data["merchant_category"],
         feast_features=feast_features,
         feast_status="live" if feast_ok else "fallback",
-        is_fraud=bool(pred),
+        is_fraud=is_fraud,
         fraud_probability=round(prob, 4),
         model_version=ctx.model_version,
         model_source="MLflow Production",
     )
 
-    if ctx.drift_monitor is not None:
-        background_tasks.add_task(
-            _run_drift_check,
-            ctx.drift_monitor,
-            pd.DataFrame([{"amount": data["amount"], "hour": data["hour"], "day_of_week": data["day_of_week"]}]),
-        )
-
     return PredictionResponse(
-        is_fraud=bool(pred),
+        is_fraud=is_fraud,
         fraud_probability=round(prob, 4),
+        decision_threshold=FRAUD_THRESHOLD,
         validation_passed=True,
         feast_status="live" if feast_ok else "fallback",
         model_source="MLflow Production",
@@ -328,26 +349,21 @@ def predict(
         request_id=request_id,
     )
 
-def _run_drift_check(monitor: DriftMonitor, row: pd.DataFrame) -> None:
-    """Called in background — silently accumulates drift stats, never raises."""
-    try:
-        monitor.check_drift(row)
-    except Exception:
-        logger.exception("Background drift check failed — continuing")
 
 @app.get("/monitoring/drift", tags=["Monitoring"])
 def drift_summary(ctx: AppState = Depends(get_ctx)):
     """Returns drift check history and summary stats."""
     if ctx.drift_monitor is None:
         raise HTTPException(status_code=503, detail="Drift monitor not available.")
+
     return {
         "summary": ctx.drift_monitor.summary(),
-        "alerts":  ctx.drift_monitor.get_alerts(),
-        "history": ctx.drift_monitor.history[-50:],   # last 50 checks
+        "alerts": ctx.drift_monitor.get_alerts(),
+        "last_checked_at": ctx.drift_monitor.last_checked_at,
+        "history": get_drift_history(limit=50),
     }
 
 
-# FIX: was @app.post — Streamlit calls this with a GET request, so it must be @app.get.
 @app.get("/monitoring/drift/check", tags=["Monitoring"])
 def run_drift_check(
     ctx: AppState = Depends(get_ctx),
@@ -360,13 +376,18 @@ def run_drift_check(
     if ctx.drift_monitor is None:
         raise HTTPException(status_code=503, detail="Drift monitor not available.")
 
-    from app.db import get_recent_predictions
     rows = get_recent_predictions(limit=window)
     if not rows:
         return {"message": "No predictions in DB yet — cannot run drift check."}
 
     current_df = pd.DataFrame(rows)
-    result = ctx.drift_monitor.check_drift(current_df)
+    result = ctx.drift_monitor.check_drift(current_df, window_size=window)
+
+    try:
+        persist_drift_result(result=result, window_size=window)
+    except Exception:
+        logger.exception("Failed to persist drift result for window=%d", window)
+
     return result
 
 
@@ -377,8 +398,6 @@ def prediction_stats(ctx: AppState = Depends(get_ctx)):
     return get_prediction_stats()
 
 
-# FIX: this endpoint was missing entirely — Streamlit's "Recent Predictions" tab
-# calls GET /monitoring/recent?limit=N, which was returning 404.
 @app.get("/monitoring/recent", tags=["Monitoring"])
 def recent_predictions(
     ctx: AppState = Depends(get_ctx),
@@ -405,11 +424,13 @@ def health(ctx: AppState = Depends(get_ctx)):
 @app.get("/model-info", tags=["Ops"], dependencies=[Depends(verify_api_key)])
 def model_info(ctx: AppState = Depends(get_ctx)):
     return {
-        "registry":         "MLflow",
-        "model_name":       "fraud-detection-model",
-        "alias":            "champion",
-        "model_version":    ctx.model_version,
-        "tracking_uri":     mlflow.get_tracking_uri(),
-        "loaded_at":        ctx.loaded_at,
-        "valid_categories": sorted(ctx.valid_categories),
+        "registry":          "MLflow",
+        "model_name":        settings.MLFLOW_MODEL_NAME,
+        "alias":             settings.MLFLOW_MODEL_ALIAS,
+        "model_version":     ctx.model_version,
+        "tracking_uri":      mlflow.get_tracking_uri(),
+        "loaded_at":         ctx.loaded_at,
+        "valid_categories":  sorted(ctx.valid_categories),
+        "decision_threshold": FRAUD_THRESHOLD,
+        "env":               settings.ENV,
     }

@@ -13,6 +13,7 @@ dependencies = [
     "mlflow>=3.11.1",
     "pandas>=2.3.3",
     "psycopg2>=2.9.11",
+    "pydantic-settings>=2.13.1",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "scikit-learn>=1.7.2",
