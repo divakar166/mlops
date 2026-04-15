@@ -46,11 +46,8 @@ mlflow.db-wal
 *.db
 
 # Models and data
-models/*.pkl
-encoder.pkl
 *.parquet
 data/*.csv
-models/
 data/
 # Reports
 *.html
