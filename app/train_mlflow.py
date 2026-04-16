@@ -29,8 +29,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
-tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-mlflow.set_tracking_uri(tracking_uri)
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+mlflow.set_experiment("fraud-detection")
 
 def load_and_preprocess_data():
     """Load and preprocess the training and test data."""
@@ -251,11 +251,14 @@ def train_and_log_model(
             mlflow.log_metric(f"importance_{feature}", importance)
         logger.info("Feature importances logged.")
 
+        for col in X_train.columns:
+            X_train[col] = X_train[col].astype("float64")
+
         logger.info("Registering model in MLflow Model Registry ...")
         print("\nRegistering model in MLflow Model Registry...")
         mlflow.sklearn.log_model(
             sk_model=model,
-            artifact_path="model",
+            name="model",
             registered_model_name="fraud-detection-model",
             input_example=X_train.iloc[:5],
         )

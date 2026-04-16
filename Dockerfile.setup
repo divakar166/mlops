@@ -5,10 +5,13 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
-    curl \
+    curl git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir numpy==1.26.4 pandas==2.3.3 mlflow==3.11.1 feast==0.49.0 python-dotenv
+RUN pip install --no-cache-dir numpy==1.26.4 pandas==2.3.3 mlflow==3.11.1 feast==0.49.0 python-dotenv uv
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync
 
 COPY . .
 
@@ -18,10 +21,10 @@ CMD ["bash", "-c", "\
   echo '=== CLEANUP: Removing stale Feast artifacts ===' && \
   rm -f /app/data/registry.db /app/data/online_store.db && \
   echo '=== STEP 1: Generating data ===' && \
-  python /app/app/generate_data.py && \
+  python -m app.generate_data && \
   echo '=== STEP 2: Preparing Feast features ===' && \
-  python /app/app/prepare_feast_feature.py && \
+  python -m app.prepare_feast_feature && \
   echo '=== STEP 3: Training model ===' && \
-  python /app/app/train_mlflow.py && \
+  python -m app.train_mlflow && \
   echo '=== Setup complete ==='\
 "]
