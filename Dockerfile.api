@@ -11,11 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy code
 COPY pyproject.toml uv.lock* requirements.txt* ./ 2>/dev/null || true
 COPY app ./app
-COPY data ./data
-COPY models ./models
 
-# Use uv or pip; adjust to your project
 RUN pip install --no-cache-dir -r requirements.txt
+RUN mkdir -p data models
 
 ENV PYTHONUNBUFFERED=1
 
