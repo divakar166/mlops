@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import os
+
+os.makedirs("data", exist_ok=True)
 
 def generate_transactions(n_samples=10000, fraud_ratio=0.02, seed=42):
     np.random.seed(seed)

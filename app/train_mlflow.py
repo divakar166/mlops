@@ -17,6 +17,8 @@ from sklearn.metrics import (
     average_precision_score,
 )
 import pickle
+from dotenv import load_dotenv
+load_dotenv()
 
 from feast_feature import get_training_features
 
@@ -27,7 +29,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
-mlflow.set_tracking_uri("http://localhost:5000")
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"), "http://localhost:5000")
 mlflow.set_experiment("fraud-detection")
 
 def load_and_preprocess_data():

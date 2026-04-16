@@ -36,6 +36,33 @@ services:
       - "5000:5000"
     volumes:
       - mlruns_data:/mlruns
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  setup:
+    build:
+      context: .
+      dockerfile: Dockerfile.setup
+    container_name: fraud_setup
+    user: "0:0"
+    environment:
+      DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./feature_repo:/app/feature_repo
+      - mlruns_data:/mlruns
+    restart: "no"
 
   api:
     build:
@@ -52,10 +79,13 @@ services:
       postgres:
         condition: service_healthy
       mlflow:
-        condition: service_started
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data:ro
       - ./models:/app/models:ro
+      - ./feature_repo:/app/feature_repo:ro
     ports:
       - "8000:8000"
 
