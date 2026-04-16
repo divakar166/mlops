@@ -21,17 +21,21 @@ services:
       context: .
       dockerfile: Dockerfile.mlflow
     container_name: fraud_mlflow
+    user: "0:0"
     command: >
       mlflow server
         --backend-store-uri postgresql://fraud:fraud@postgres:5432/fraud
         --default-artifact-root /mlruns
         --host 0.0.0.0
         --port 5000
+        --allowed-hosts '*'
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "5000:5000"
+    volumes:
+      - mlruns_data:/mlruns
 
   api:
     build:
@@ -72,3 +76,4 @@ services:
 
 volumes:
   pgdata:
+  mlruns_data:
