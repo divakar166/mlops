@@ -29,8 +29,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
-mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"), "http://localhost:5000")
-mlflow.set_experiment("fraud-detection")
+tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+mlflow.set_tracking_uri(tracking_uri)
 
 def load_and_preprocess_data():
     """Load and preprocess the training and test data."""
