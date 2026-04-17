@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
     # if missing:
     #     raise RuntimeError(f"Missing required environment variables: {missing}")
     
-    tracking_uri = settings.MLFLOW_TRACKING_URI
+    tracking_uri = str(settings.MLFLOW_TRACKING_URI)
     model_uri = f"models:/{settings.MLFLOW_MODEL_NAME}@{settings.MLFLOW_MODEL_ALIAS}"
     mlflow.set_tracking_uri(tracking_uri)
     logger.info("MLflow tracking URI: %s", tracking_uri)

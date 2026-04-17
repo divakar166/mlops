@@ -10,7 +10,7 @@ merchant = Entity(
 
 merchant_stats_source = FileSource(
     name="merchant_stats_source",
-    path="../data/merchant_features.parquet",
+    path="/app/data/merchant_features.parquet",
     timestamp_field="event_timestamp",
 )
 

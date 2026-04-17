@@ -26,12 +26,16 @@ services:
       mlflow server
         --backend-store-uri postgresql://fraud:fraud@postgres:5432/fraud
         --default-artifact-root /mlruns
+        --serve-artifacts
         --host 0.0.0.0
         --port 5000
         --allowed-hosts '*'
     depends_on:
       postgres:
         condition: service_healthy
+    environment:
+      - MLFLOW_SERVER_ALLOWED_HOSTS=*
+      - MLFLOW_SERVER_CORS_ALLOWED_ORIGINS=*
     ports:
       - "5000:5000"
     volumes:
@@ -86,6 +90,7 @@ services:
       - ./data:/app/data:ro
       - ./models:/app/models:ro
       - ./feature_repo:/app/feature_repo:ro
+      - mlruns_data:/mlruns
     ports:
       - "8000:8000"
 

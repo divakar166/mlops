@@ -2,21 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps (psycopg, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
+    build-essential libpq-dev curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy code
-COPY pyproject.toml uv.lock* requirements.txt* ./ 2>/dev/null || true
+# ADD THESE:
+RUN curl -Ls https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+COPY pyproject.toml uv.lock ./
 COPY app ./app
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv sync --frozen               # use --frozen to respect lockfile
+
 RUN mkdir -p data models
-
 ENV PYTHONUNBUFFERED=1
-
 EXPOSE 8000
-
-CMD ["uvicorn", "app.serve_models:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "app.serve_models:app", "--host", "0.0.0.0", "--port", "8000"]
