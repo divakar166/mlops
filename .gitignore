@@ -49,6 +49,9 @@ mlflow.db-wal
 *.parquet
 data/*.csv
 data/
+models/
+*.pkl
+
 # Reports
 *.html
 drift_report.html

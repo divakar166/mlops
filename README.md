@@ -1,319 +1,264 @@
-# Fraud Detection MLOps Pipeline
+# Fraud Detection MLOps Project
 
-A production-grade, end-to-end MLOps pipeline for real-time credit card fraud detection — built with industry-standard tools to demonstrate the full lifecycle of a machine learning system, from data generation to model monitoring.
+An end-to-end MLOps project for fraud detection with:
 
----
+- MLflow for experiment tracking and model registry
+- Feast for offline and online features
+- FastAPI for model serving
+- Streamlit for the demo UI
+- PostgreSQL for prediction and drift-monitoring storage
+- Docker Compose for orchestration
+
+The current workflow is registry-driven: the API serves the model version that is promoted in MLflow with the `champion` alias.
+
+## Project Flow
+
+The project runs in this sequence:
+
+1. Start infrastructure services: PostgreSQL and MLflow.
+2. Run the one-time `setup` job.
+3. In MLflow, review the trained model versions and assign the `champion` alias to the best one.
+4. Start the API and Streamlit services.
+
+That means the application layer does not serve "the latest trained model" automatically. It serves the model version explicitly promoted in the MLflow Model Registry.
 
 ## Architecture
 
-```
-┌──────────────┐     ┌────────────────────┐     ┌───────────────────┐
-│  Synthetic   │────▶│  Data Validation  │────▶│   Model Training  │
-│  Data Gen    │     │  (Great Expects.)  │     │   (scikit-learn)  │
-└──────────────┘     └────────────────────┘     └────────┬──────────┘
-                                                         │
-                     ┌──────────────────┐                │
-                     │  Feature Store   │◀────────────┤
-                     │  (Feast)         │              │
-                     └──────┬───────────┘              ▼
-                            │               ┌─────────────────┐
-                            │               │  Experimen      │
-                            │               │  Tracking       │
-                            │               │  (MLflow)       │
-                            │               └────────┬────────┘
-                            │                        │
-                            ▼                        ▼
-                     ┌──────────────────┐    ┌─────────────────┐
-                     │  Online Features  │──▶│  Model Serving  │
-                     │  (low-latency)    │    │  (FastAPI)       │
-                     └──────────────────┘     └────────┬────────┘
-                                                       │
-                     ┌──────────────────┐              │
-                     │  Drift Detection  │◀────────────┘
-                     │  (Evidently AI)   │
-                     └──────────────────┘
-                            │
-                     ┌──────────────────┐
-                     │  CI/CD Pipeline   │
-                     │  (GitHub Actions) │
-                     └──────────────────┘
+```text
+Synthetic data -> Feast feature prep -> MLflow training + registry
+                    |
+                    v
+      Promote best version as @champion
+                    |
+                    v
+Postgres <-> FastAPI <-> Feast online features
+                    |
+                    v
+               Streamlit UI
 ```
 
----
+## Repository Structure
 
-## Key Features
-
-| Component               | Tool                    | What It Does                                                                     |
-| ----------------------- | ----------------------- | -------------------------------------------------------------------------------- |
-| **Data Generation**     | NumPy / Pandas          | Generates realistic synthetic transaction data with configurable fraud ratios    |
-| **Data Validation**     | Great Expectations      | Validates individual transactions and entire batches against quality rules       |
-| **Feature Store**       | Feast                   | Manages merchant-level features for both training (offline) and serving (online) |
-| **Experiment Tracking** | MLflow                  | Tracks hyperparameters, metrics, artifacts, and registers models                 |
-| **Model Serving**       | FastAPI                 | Production-ready REST API with input validation, health checks, and Swagger docs |
-| **Drift Monitoring**    | Evidently AI + SciPy    | Detects data drift using KS tests and generates visual HTML reports              |
-| **Containerization**    | Docker / Docker Compose | Packages the API alongside the MLflow server for portable deployment             |
-| **CI/CD**               | GitHub Actions          | Automated testing, Docker build, and API validation on every push                |
-
----
-
-## Project Structure
-
-```
+```text
 mlops/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                  # CI/CD pipeline definition
-├── data/
-│   ├── train.csv                   # Training dataset (80%)
-│   ├── test.csv                    # Test dataset (20%)
-│   └── merchant_features.parquet   # Feast feature source
-├── feature_repo/
-│   ├── feature_store.yaml          # Feast configuration
-│   └── feature_definitions.py      # Entity & FeatureView definitions
-├── models/
-│   └── model.pkl                   # Trained model artifact
-├── src/
-│   ├── generate_data.py            # Synthetic data generator
-│   ├── data_validation.py          # GX-based validation logic
-│   ├── train_naive.py              # Standalone training script
-│   ├── train_mlflow.py             # MLflow-tracked training + sweep
-│   ├── serve_naive.py              # Basic FastAPI serving (v1)
-│   ├── serve_validated.py          # Validated serving with MLflow (v3)
-│   ├── serve_mlflow.py             # Champion model serving (v2)
-│   ├── monitoring.py               # Drift detection & reporting
-│   ├── feast_feature.py            # Feast retrieval helpers
-│   ├── prepare_feast_feature.py    # Compute & materialize features
-│   └── test_bad_data.py            # Validation edge-case demos
-├── tests/
-│   ├── test_data_models.py         # Data quality & model performance tests
-│   └── test_api.py                 # API integration tests
-├── Dockerfile                      # Container image definition
-├── docker-compose.yml              # Multi-service orchestration
-├── pyproject.toml                  # Project metadata & dependencies
-├── requirements.txt                # Pip dependencies
-└── README.md
+|-- app/
+|   |-- config.py                  # Environment-based app configuration
+|   |-- data_validation.py         # Request/data validation helpers
+|   |-- db.py                      # Postgres persistence for predictions and drift results
+|   |-- feast_feature.py           # Feast offline/online feature retrieval
+|   |-- generate_data.py           # Synthetic fraud dataset generation
+|   |-- monitoring.py              # Drift detection logic
+|   |-- prepare_feast_feature.py   # Merchant feature computation + Feast materialization
+|   |-- serve_models.py            # FastAPI inference service
+|   |-- streamlit_app.py           # Streamlit demo and monitoring dashboard
+|   `-- train_mlflow.py            # MLflow training and model registration
+|-- data/                          # Generated datasets and Feast artifacts
+|-- feature_repo/
+|   |-- feature_definitions.py     # Feast entities and feature views
+|   `-- feature_store.yaml         # Feast repo configuration
+|-- docker-compose.yml             # Service orchestration
+|-- Dockerfile.api                 # API image
+|-- Dockerfile.mlflow              # MLflow server image
+|-- Dockerfile.setup               # One-shot setup/training image
+|-- Dockerfile.streamlit           # Streamlit image
+|-- pyproject.toml                 # Python project metadata
+|-- requirements.txt               # Dependency snapshot
+`-- README.md
 ```
 
----
+## Services
+
+### `postgres`
+
+Stores:
+
+- API prediction logs
+- Drift check history
+- MLflow backend metadata
+
+### `mlflow`
+
+Provides:
+
+- experiment tracking
+- model registry
+- model alias management
+- artifact serving
+
+### `setup`
+
+This is a one-shot initialization job. It performs the pipeline in order:
+
+1. cleans stale local Feast artifacts
+2. generates training and test data
+3. prepares and materializes Feast features
+4. trains multiple model runs
+5. registers trained models in MLflow
+6. saves the label encoder to `models/encoder.pkl`
+
+### `api`
+
+The FastAPI service:
+
+- loads the model from `models:/fraud-detection-model@champion`
+- loads the encoder from `models/encoder.pkl`
+- fetches live merchant features from Feast
+- validates incoming transactions
+- applies API key auth and rate limits
+- stores predictions in PostgreSQL
+- exposes monitoring endpoints
+
+### `streamlit`
+
+The Streamlit app provides:
+
+- transaction scoring UI
+- monitoring dashboard
+- drift summary view
+- recent predictions view
 
 ## Getting Started
 
 ### Prerequisites
 
-- **Python** 3.10 – 3.11
-- **Docker** & **Docker Compose** (for containerized deployment)
-- **uv** (recommended) or **pip** for dependency management
+- Docker and Docker Compose
+- Optional for local Python runs: Python 3.10 or 3.11 and `uv`
 
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/divakar166/mlops.git
-cd mlops
-```
-
-### 2. Install Dependencies
+### 1. Start PostgreSQL and MLflow
 
 ```bash
-# Using uv (recommended)
-uv sync
-
-# Or using pip
-pip install -r requirements.txt
+docker compose up postgres mlflow -d
 ```
 
-### 3. Generate the Dataset
+Once these services are healthy, MLflow is available at [http://localhost:5000](http://localhost:5000).
+
+### 2. Run the setup job
 
 ```bash
-python src/generate_data.py
+docker compose run --rm setup
 ```
 
-This creates `data/train.csv` (8,000 transactions) and `data/test.csv` (2,000 transactions) with a 2% fraud ratio. Legitimate transactions follow realistic log-normal spending patterns; fraudulent ones exhibit late-night, high-amount, online-heavy behavior.
+This command prepares the full project state:
 
-### 4. Train the Model
+- creates the dataset
+- computes and materializes Feast features
+- runs the MLflow training sweep
+- registers model versions
+- writes `models/encoder.pkl`
 
-**Option A: Standalone (no MLflow required)**
+### 3. Promote the best model in MLflow
+
+Open [http://localhost:5000](http://localhost:5000), compare the registered model versions, and assign the `champion` alias to the best one.
+
+The API expects:
+
+- registered model name: `fraud-detection-model`
+- alias used for serving: `champion`
+
+Important: the API will fail to start correctly if no model version has the `champion` alias.
+
+### 4. Start the API and Streamlit app
 
 ```bash
-python src/train_naive.py
+docker compose up api streamlit -d
 ```
 
-Trains a Random Forest classifier and saves `models/model.pkl`.
+Then open:
 
-**Option B: With MLflow tracking + hyperparameter sweep**
+- API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+- Streamlit UI: [http://localhost:8501](http://localhost:8501)
 
-```bash
-# Start MLflow server first
-mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db
+## Runtime Configuration
 
-# In a new terminal, run the experiment sweep
-python src/train_mlflow.py
+The API and Streamlit services use `.env.api`.
+
+Important values:
+
+- `FRAUD_API_KEY`: required for protected API endpoints
+- `MLFLOW_MODEL_NAME`: defaults to `fraud-detection-model`
+- `MLFLOW_MODEL_ALIAS`: defaults to `champion`
+- `FRAUD_THRESHOLD`: default threshold, overridden by MLflow if the selected run logged `optimal_threshold`
+- `REFERENCE_DATA_PATH`: reference dataset used for drift monitoring
+
+Example header for protected endpoints:
+
+```http
+x-api-key: supersecretapikey
 ```
 
-This trains 5 model configurations, logging all params, metrics, and artifacts to MLflow. Visit `http://localhost:5000` to compare runs and promote the best model.
+## API Overview
 
----
+### Main endpoints
 
-## Component Deep Dives
+- `POST /predict` - score a transaction
+- `GET /health` - service health check
+- `GET /model-info` - loaded model metadata
+- `GET /monitoring/stats` - aggregate prediction metrics
+- `GET /monitoring/recent` - latest predictions
+- `GET /monitoring/drift` - drift summary and history
+- `GET /monitoring/drift/check?window=100` - run a manual drift check
 
-### Data Validation (Great Expectations)
-
-Validates data at **two levels**:
-
-1. **Single-transaction validation** — Real-time checks on individual API requests (amount > 0, valid hour, known merchant category, etc.)
-2. **Batch validation** — Full-dataset quality gates using Great Expectations expectation suites (null checks, range constraints, set membership)
-
-```bash
-python src/data_validation.py
-```
-
-### Feature Store (Feast)
-
-Manages merchant-level aggregate features (average amount, transaction count, fraud rate):
-
-```bash
-# Step 1: Compute and materialize features
-python src/prepare_feast_feature.py
-
-# Step 2: Test online + offline retrieval
-python src/feast_feature.py
-```
-
-- **Offline store** — Used during training for point-in-time correct feature joins
-- **Online store** — Used during serving for low-latency feature lookups
-
-### Drift Monitoring (Evidently AI)
-
-Simulates four real-world drift scenarios and generates an interactive HTML report:
-
-```bash
-python src/monitoring.py
-```
-
-| Scenario         | What Changes                | Expected Drift |
-| ---------------- | --------------------------- | -------------- |
-| Test data        | Nothing (baseline)          | Minimal        |
-| Fraud spike      | Fraud rate 2% → 10%         | Moderate       |
-| Amount inflation | All amounts ×2              | Amount column  |
-| Time shift       | All transactions late-night | Hour column    |
-
-The generated `drift_report.html` can be opened in any browser for detailed visualizations.
-
-### Model Serving (FastAPI)
-
-Three API versions demonstrate progressive improvements:
-
-| Version | Script               | Features                                         |
-| ------- | -------------------- | ------------------------------------------------ |
-| **v1**  | `serve_naive.py`     | Basic prediction from pickle                     |
-| **v2**  | `serve_mlflow.py`    | Loads `@champion` model from MLflow Registry     |
-| **v3**  | `serve_validated.py` | v2 + input validation, rejects bad data with 400 |
-
-```bash
-# Start the API (v3 - recommended)
-uvicorn src.serve_validated:app --host 0.0.0.0 --port 8000
-
-# Interactive docs available at:
-# http://localhost:8000/docs
-```
-
-**Example request:**
+### Example prediction request
 
 ```bash
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
+  -H "x-api-key: supersecretapikey" \
   -d '{
-    "amount": 500.00,
-    "hour": 3,
-    "day_of_week": 1,
+    "amount": 850.0,
+    "hour": 2,
+    "day_of_week": 6,
     "merchant_category": "online"
   }'
 ```
 
-**Example response:**
+## Local Development
 
-```json
-{
-  "is_fraud": true,
-  "fraud_probability": 0.87,
-  "model_source": "MLflow Production",
-  "validation_passed": true
-}
-```
-
----
-
-## Docker Deployment
-
-Run the full stack (MLflow server + Fraud Detection API) with a single command:
+If you want to run parts of the project without Docker for the app layer:
 
 ```bash
-docker-compose up --build
+uv sync
+uv run uvicorn app.serve_models:app --host 0.0.0.0 --port 8000
+uv run streamlit run app/streamlit_app.py
 ```
 
-| Service      | URL                          | Description              |
-| ------------ | ---------------------------- | ------------------------ |
-| **API**      | `http://localhost:8000`      | Fraud detection endpoint |
-| **API Docs** | `http://localhost:8000/docs` | Swagger UI               |
-| **MLflow**   | `http://localhost:5000`      | Experiment dashboard     |
+For local runs, make sure:
 
-The Dockerfile includes a `HEALTHCHECK` that pings `/health` every 30 seconds to ensure the API is responsive.
+- PostgreSQL is available
+- MLflow is running
+- the setup flow has already been completed
+- a `champion` model alias exists in MLflow
+- `models/encoder.pkl` exists
 
----
+## Operational Notes
 
-## Testing
+- `setup` is intended as a batch initialization step, not a long-running service.
+- Feast online lookups have a fallback path if a merchant feature is unavailable.
+- Predictions and drift checks are persisted in PostgreSQL.
+- Drift monitoring uses `data/train.csv` as the default reference dataset.
+- The API reads the promoted model version at startup, so if you change the `champion` alias, restart the API to load the new model.
 
-The project includes two test suites:
-
-### Data & Model Tests
-
-Validates data quality (no nulls, valid ranges, reasonable fraud ratio) and model performance (accuracy ≥ 90%, F1 ≥ 0.3, non-zero precision & recall):
+## Recommended Startup Commands
 
 ```bash
-pytest tests/test_data_models.py -v
+docker compose up postgres mlflow -d
+docker compose run --rm setup
+# Promote best registered model as @champion in MLflow UI
+docker compose up api streamlit -d
 ```
-
-### API Integration Tests
-
-Tests the live API endpoints for correct responses, validation rejections, and edge cases:
-
-```bash
-# Requires the API to be running on localhost:8000
-pytest tests/test_api.py -v
-```
-
----
-
-## CI/CD Pipeline
-
-The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push to `main`/`develop` and every PR to `main`:
-
-```
-Checkout → Install deps → Generate data → Train model → Run data/model tests
-    → Build Docker image → Start container → Run API tests → Cleanup
-```
-
-This ensures that every code change is validated against data quality checks, model performance thresholds, and API contract tests **before** it can be merged.
-
----
 
 ## Tech Stack
 
-| Category                | Technologies                              |
-| ----------------------- | ----------------------------------------- |
-| **Language**            | Python 3.11                               |
-| **ML Framework**        | scikit-learn (Random Forest)              |
-| **API Framework**       | FastAPI + Uvicorn                         |
-| **Experiment Tracking** | MLflow (Model Registry + Tracking Server) |
-| **Data Validation**     | Great Expectations                        |
-| **Feature Store**       | Feast (offline + online)                  |
-| **Monitoring**          | Evidently AI, SciPy (KS test)             |
-| **Containerization**    | Docker, Docker Compose                    |
-| **CI/CD**               | GitHub Actions                            |
-| **Data**                | Pandas, NumPy, Parquet                    |
-| **Testing**             | pytest, httpx                             |
-
----
+- Python
+- FastAPI
+- Streamlit
+- MLflow
+- Feast
+- PostgreSQL
+- scikit-learn
+- Pandas
+- Docker Compose
 
 ## License
 
-This project is open-source and available for educational and portfolio purposes.
+This repository is intended for learning, experimentation, and portfolio use.

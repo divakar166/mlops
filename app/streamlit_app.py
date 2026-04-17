@@ -4,6 +4,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Config
 st.set_page_config(
@@ -12,10 +16,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+API_BASE_URL = os.getenv("API_BASE_URL")
+
 # Sidebar
 with st.sidebar:
     st.title("Settings")
-    API_BASE = st.text_input("API Base URL", value="http://localhost:8000")
+    API_BASE = st.text_input("API Base URL", value=API_BASE_URL)
     API_KEY  = st.text_input("API Key", value="", type="password")
     st.divider()
     auto_refresh = st.toggle("Auto-refresh monitoring (10s)", value=False)
