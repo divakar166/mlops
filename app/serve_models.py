@@ -82,10 +82,6 @@ async def lifespan(app: FastAPI):
 
     t0 = time.perf_counter()
     logger.info("Starting up fraud-detection service …")
-
-    # missing = [v for v in ("FRAUD_API_KEY", "DATABASE_URL") if not os.getenv(v)]
-    # if missing:
-    #     raise RuntimeError(f"Missing required environment variables: {missing}")
     
     tracking_uri = str(settings.MLFLOW_TRACKING_URI)
     model_uri = f"models:/{settings.MLFLOW_MODEL_NAME}@{settings.MLFLOW_MODEL_ALIAS}"
@@ -359,7 +355,7 @@ def drift_summary(ctx: AppState = Depends(get_ctx)):
     return {
         "summary": ctx.drift_monitor.summary(),
         "alerts": ctx.drift_monitor.get_alerts(),
-        "last_checked_at": ctx.drift_monitor.last_checked_at,
+        # "last_checked_at": ctx.drift_monitor.last_checked_at,
         "history": get_drift_history(limit=50),
     }
 

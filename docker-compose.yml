@@ -84,8 +84,6 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_healthy
-      setup:
-        condition: service_completed_successfully
     volumes:
       - ./data:/app/data:ro
       - ./models:/app/models:ro
@@ -93,6 +91,12 @@ services:
       - mlruns_data:/mlruns
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   streamlit:
     build:
@@ -105,7 +109,7 @@ services:
       API_BASE_URL: http://api:8000
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8501:8501"
 

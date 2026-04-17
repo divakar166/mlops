@@ -316,7 +316,7 @@ with tab_recent:
 
         def highlight_fraud(row):
             if bool(row["is_fraud"]):
-                return ["background-color: #fadbd8"] * len(row)
+                return ["background-color: #fadbd8; color: black"] * len(row)
             return [""] * len(row)
 
         display_cols = [c for c in [
