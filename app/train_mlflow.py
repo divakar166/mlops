@@ -20,7 +20,7 @@ import pickle
 from dotenv import load_dotenv
 load_dotenv()
 
-from feast_feature import get_training_features
+from app.feast_feature import get_training_features
 
 logger = logging.getLogger("train_mlflow")
 logging.basicConfig(
@@ -31,6 +31,7 @@ logging.basicConfig(
 
 mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
 mlflow.set_experiment("fraud-detection")
+logger.info(f"MLFLOW TRACKING URL: {os.getenv("MLFLOW_TRACKING_URI")}")
 
 def load_and_preprocess_data():
     """Load and preprocess the training and test data."""
