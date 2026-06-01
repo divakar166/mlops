@@ -19,7 +19,7 @@ services:
   mlflow:
     build:
       context: .
-      dockerfile: Dockerfile.mlflow
+      dockerfile: Docker/Dockerfile.mlflow
     container_name: fraud_mlflow
     user: "0:0"
     command: >
@@ -50,7 +50,7 @@ services:
   setup:
     build:
       context: .
-      dockerfile: Dockerfile.setup
+      dockerfile: Docker/Dockerfile.setup
     container_name: fraud_setup
     user: "0:0"
     environment:
@@ -71,7 +71,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Docker/Dockerfile.api
     container_name: fraud_api
     env_file:
       - .env.api
@@ -101,7 +101,7 @@ services:
   streamlit:
     build:
       context: .
-      dockerfile: Dockerfile.streamlit
+      dockerfile: Docker/Dockerfile.streamlit
     container_name: fraud_streamlit
     env_file:
       - .env.api
