@@ -2,6 +2,7 @@ import logging
 from datetime import datetime
 
 import os
+import shutil
 import numpy as np
 import pandas as pd
 import mlflow
@@ -29,8 +30,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
+EXPERIMENT_NAME = "fraud-detection"
+REGISTERED_MODEL_NAME = "fraud-detection-model"
+CHAMPION_ALIAS = "champion"
+
 mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
-mlflow.set_experiment("fraud-detection")
+mlflow.set_experiment(EXPERIMENT_NAME)
 logger.info(f"MLFLOW TRACKING URL: {os.getenv('MLFLOW_TRACKING_URI')}")
 
 def load_and_preprocess_data():
@@ -104,6 +109,7 @@ def train_and_log_model(
     X_train, y_train, X_test, y_test, encoder = load_and_preprocess_data()
 
     with mlflow.start_run():
+        run_id = mlflow.active_run().info.run_id
         run_name = f"rf_est{n_estimators}_depth{max_depth}_{datetime.now().strftime('%H%M%S')}"
         mlflow.set_tag("mlflow.runName", run_name)
         logger.info("MLflow run started: %s", run_name)
@@ -219,8 +225,8 @@ def train_and_log_model(
                 cost_t = FP_COST * fp + FN_COST * fn
 
                 # Optional detailed logging per threshold:
-                # mlflow.log_metric(f"thr_{t:.2f}_cost", cost_t)
-                # mlflow.log_metric(f"thr_{t:.2f}_f1", f1_t)
+                mlflow.log_metric(f"thr_{t:.2f}_cost", cost_t)
+                mlflow.log_metric(f"thr_{t:.2f}_f1", f1_t)
 
                 if cost_t < best_cost or (cost_t == best_cost and f1_t > best_f1):
                     best_cost = cost_t
@@ -239,7 +245,7 @@ def train_and_log_model(
                 best_cost,
                 best_f1,
             )
-            print(
+            logger.info(
                 f"\nOptimal threshold on TEST (FP={FP_COST}, FN={FN_COST}): "
                 f"t={best_t:.2f}, cost={best_cost:.1f}, F1={best_f1:.4f}"
             )
@@ -255,37 +261,267 @@ def train_and_log_model(
         for col in X_train.columns:
             X_train[col] = X_train[col].astype("float64")
 
-        logger.info("Registering model in MLflow Model Registry ...")
-        print("\nRegistering model in MLflow Model Registry...")
+        logger.info("Logging model artifact to MLflow run ...")
         mlflow.sklearn.log_model(
             sk_model=model,
             name="model",
-            registered_model_name="fraud-detection-model",
             input_example=X_train.iloc[:5],
         )
 
         os.makedirs("models", exist_ok=True)
-        encoder_path = "models/encoder.pkl"
+        encoder_path = f"models/encoder_{run_id}.pkl"
         with open(encoder_path, "wb") as f:
             pickle.dump(encoder, f)
-        mlflow.log_artifact(encoder_path)
+        mlflow.log_artifact(encoder_path, artifact_path="encoder")
         logger.info("Saved and logged encoder artifact at %s", encoder_path)
 
-        run_id = mlflow.active_run().info.run_id
         logger.info("MLflow Run ID: %s", run_id)
-        print(f"\nMLflow Run ID: {run_id}")
-        print(f"View this run: http://localhost:5000/#/experiments/1/runs/{run_id}")
+        logger.info(f"\nMLflow Run ID: {run_id}")
+        logger.info(f"View this run: http://localhost:5000/#/experiments/1/runs/{run_id}")
 
         return model, encoder
 
+REQUIRED_SELECTION_METRICS = [
+    "test_recall",
+    "test_precision",
+    "train_f1",
+    "test_f1",
+    "test_pr_auc",
+    "optimal_threshold_cost",
+]
+
+
+def _artifact_exists(run_id: str, artifact_path: str) -> bool:
+    try:
+        artifacts = mlflow.artifacts.list_artifacts(
+            run_id=run_id,
+            artifact_path=artifact_path,
+        )
+        return bool(artifacts)
+    except Exception:
+        logger.exception(
+            "Failed to inspect artifact_path=%s for run_id=%s",
+            artifact_path,
+            run_id,
+        )
+        return False
+
+
+def _encoder_artifact_exists(run_id: str) -> bool:
+    expected_path = f"encoder/encoder_{run_id}.pkl"
+    try:
+        artifacts = mlflow.artifacts.list_artifacts(
+            run_id=run_id,
+            artifact_path="encoder",
+        )
+        return any(artifact.path == expected_path for artifact in artifacts)
+    except Exception:
+        logger.exception("Failed to inspect encoder artifact for run_id=%s", run_id)
+        return False
+
+
+def select_best_model() -> dict:
+    """Select the champion run from the current MLflow experiment."""
+    experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+    if experiment is None:
+        raise RuntimeError(f"MLflow experiment not found: {EXPERIMENT_NAME}")
+
+    runs_df = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        output_format="pandas",
+    )
+    if runs_df.empty:
+        raise RuntimeError(f"No runs found in MLflow experiment: {EXPERIMENT_NAME}")
+
+    logger.info("Total runs evaluated for champion selection: %d", len(runs_df))
+
+    metric_cols = [f"metrics.{metric}" for metric in REQUIRED_SELECTION_METRICS]
+    for col in metric_cols:
+        if col not in runs_df.columns:
+            runs_df[col] = np.nan
+
+    candidate_cols = ["run_id"] + metric_cols
+    candidates = runs_df[candidate_cols].copy()
+    candidates = candidates.rename(
+        columns={f"metrics.{metric}": metric for metric in REQUIRED_SELECTION_METRICS}
+    )
+
+    for metric in REQUIRED_SELECTION_METRICS:
+        candidates[metric] = pd.to_numeric(candidates[metric], errors="coerce")
+
+    metric_missing = candidates[REQUIRED_SELECTION_METRICS].isna().any(axis=1)
+    artifact_missing = []
+    for run_id in candidates["run_id"]:
+        has_model = _artifact_exists(run_id, "model")
+        has_encoder = _encoder_artifact_exists(run_id)
+        artifact_missing.append(not (has_model and has_encoder))
+
+    candidates["rejection_reason"] = ""
+    candidates.loc[metric_missing, "rejection_reason"] = "missing_metrics"
+    candidates.loc[artifact_missing, "rejection_reason"] = "missing_artifacts"
+
+    valid_runs = candidates[candidates["rejection_reason"] == ""].copy()
+    if valid_runs.empty:
+        raise RuntimeError(
+            "No runs have the required metrics plus model and encoder artifacts."
+        )
+
+    eligible = valid_runs[
+        (valid_runs["test_recall"] >= 0.75)
+        & (valid_runs["test_precision"] >= 0.50)
+        & ((valid_runs["train_f1"] - valid_runs["test_f1"]).abs() <= 0.15)
+    ].copy()
+
+    fallback_used = eligible.empty
+    if fallback_used:
+        logger.warning(
+            "No runs satisfied champion eligibility constraints; falling back to "
+            "highest test_recall model."
+        )
+        selected_pool = valid_runs.copy()
+    else:
+        selected_pool = eligible
+
+    min_cost = selected_pool["optimal_threshold_cost"].min()
+    max_cost = selected_pool["optimal_threshold_cost"].max()
+    if max_cost == min_cost:
+        selected_pool["normalized_cost"] = 0.0
+    else:
+        selected_pool["normalized_cost"] = (
+            (selected_pool["optimal_threshold_cost"] - min_cost)
+            / (max_cost - min_cost)
+        )
+
+    selected_pool["score"] = (
+        0.35 * selected_pool["test_pr_auc"]
+        + 0.25 * selected_pool["test_recall"]
+        + 0.20 * selected_pool["test_f1"]
+        + 0.10 * selected_pool["test_precision"]
+        - 0.10 * selected_pool["normalized_cost"]
+    )
+
+    if fallback_used:
+        selected_pool = selected_pool.sort_values(
+            by=[
+                "test_recall",
+                "score",
+                "optimal_threshold_cost",
+                "test_pr_auc",
+                "test_f1",
+            ],
+            ascending=[False, False, True, False, False],
+        )
+    else:
+        selected_pool = selected_pool.sort_values(
+            by=["score", "optimal_threshold_cost", "test_pr_auc", "test_f1"],
+            ascending=[False, True, False, False],
+        )
+
+    champion = selected_pool.iloc[0]
+    champion_run_id = champion["run_id"]
+    champion_model_uri = f"runs:/{champion_run_id}/model"
+    champion_metrics = {
+        metric: float(champion[metric]) for metric in REQUIRED_SELECTION_METRICS
+    }
+    champion_metrics["normalized_cost"] = float(champion["normalized_cost"])
+    champion_metrics["score"] = float(champion["score"])
+
+    eligible_count = len(eligible)
+    rejected_count = len(candidates) - len(valid_runs)
+    logger.info("Eligible runs count: %d", eligible_count)
+    logger.info("Rejected runs count: %d", rejected_count)
+    logger.info("Selected champion run_id: %s", champion_run_id)
+    logger.info("Champion score: %.6f", champion_metrics["score"])
+    logger.info("Fallback used: %s", fallback_used)
+
+    return {
+        "run_id": champion_run_id,
+        "metrics": champion_metrics,
+        "model_uri": champion_model_uri,
+        "fallback_used": fallback_used,
+        "eligible_runs": eligible_count,
+        "rejected_runs": rejected_count,
+        "total_runs": len(runs_df),
+    }
+
+
+def register_champion(champion: dict) -> dict:
+    """Register the selected run model and promote it with the champion alias."""
+    run_id = champion["run_id"]
+    model_uri = champion["model_uri"]
+    encoder_artifact_path = f"encoder/encoder_{run_id}.pkl"
+    encoder_artifact_uri = f"runs:/{run_id}/{encoder_artifact_path}"
+
+    if not _artifact_exists(run_id, "model"):
+        raise RuntimeError(f"Champion model artifact missing for run_id={run_id}")
+    if not _encoder_artifact_exists(run_id):
+        raise RuntimeError(f"Champion encoder artifact missing for run_id={run_id}")
+
+    logger.info(
+        "Registering champion model from %s as %s",
+        model_uri,
+        REGISTERED_MODEL_NAME,
+    )
+    model_version = mlflow.register_model(
+        model_uri=model_uri,
+        name=REGISTERED_MODEL_NAME,
+    )
+
+    client = mlflow.MlflowClient()
+    client.set_registered_model_alias(
+        REGISTERED_MODEL_NAME,
+        CHAMPION_ALIAS,
+        model_version.version,
+    )
+    client.set_model_version_tag(
+        REGISTERED_MODEL_NAME,
+        model_version.version,
+        "alias",
+        CHAMPION_ALIAS,
+    )
+    client.set_model_version_tag(
+        REGISTERED_MODEL_NAME,
+        model_version.version,
+        "champion_run_id",
+        run_id,
+    )
+    client.set_model_version_tag(
+        REGISTERED_MODEL_NAME,
+        model_version.version,
+        "encoder_artifact_uri",
+        encoder_artifact_uri,
+    )
+
+    os.makedirs("models", exist_ok=True)
+    champion_encoder_path = f"models/encoder_{run_id}.pkl"
+    runtime_encoder_path = "models/encoder.pkl"
+    if not os.path.exists(champion_encoder_path):
+        downloaded_path = mlflow.artifacts.download_artifacts(
+            artifact_uri=encoder_artifact_uri,
+            dst_path="models",
+        )
+        champion_encoder_path = downloaded_path
+    shutil.copyfile(champion_encoder_path, runtime_encoder_path)
+    logger.info("Champion encoder linked at %s", runtime_encoder_path)
+
+    logger.info(
+        "Promoted model version %s to alias @%s",
+        model_version.version,
+        CHAMPION_ALIAS,
+    )
+    return {
+        "model_name": REGISTERED_MODEL_NAME,
+        "model_version": model_version.version,
+        "alias": CHAMPION_ALIAS,
+        "run_id": run_id,
+        "model_uri": model_uri,
+        "encoder_artifact_uri": encoder_artifact_uri,
+    }
 
 def run_experiment_sweep():
     logger.info("-" * 60)
     logger.info("RUNNING HYPERPARAMETER EXPERIMENT SWEEP")
     logger.info("-" * 60)
-    print("-" * 60)
-    print("RUNNING HYPERPARAMETER EXPERIMENT SWEEP")
-    print("-" * 60)
 
     # Define different configurations to try
     experiments = [
@@ -299,15 +535,18 @@ def run_experiment_sweep():
 
     for i, params in enumerate(experiments, 1):
         logger.info("Starting experiment %d/%d with params=%s", i, len(experiments), params)
-        print(f"\n--- Experiment {i}/{len(experiments)} ---")
+        logger.info(f"\n--- Experiment {i}/{len(experiments)} ---")
         train_and_log_model(**params)
+    champion = select_best_model()
+    registered_champion = register_champion(champion)
 
-    logger.info("EXPERIMENT SWEEP COMPLETE")
-    print("\n" + "-" * 60)
-    print("EXPERIMENT SWEEP COMPLETE!")
-    print("-" * 60)
-    print("\nView all experiments at: http://localhost:5000")
-    print("Compare runs to find the best hyperparameters!")
+    logger.info("Champion selected: %s", champion)
+    logger.info("Champion registered: %s", registered_champion)
+
+    logger.info("EXPERIMENT SWEEP COMPLETE!")
+    logger.info("-" * 60)
+    logger.info("View all experiments at: http://localhost:5000")
+    logger.info("Champion model is available as @%s", CHAMPION_ALIAS)
 
 
 if __name__ == "__main__":
